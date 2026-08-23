@@ -77,6 +77,7 @@ class DiskCacheMetadata:
     cached_positions: Optional[torch.Tensor] = None
     fmt: Optional[MemoryFormat] = None
     pin_count: int = 0
+    cached_context_hash: Optional[bytes] = None
 
     def pin(self) -> bool:
         self.pin_count += 1

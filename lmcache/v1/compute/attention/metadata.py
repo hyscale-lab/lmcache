@@ -35,6 +35,14 @@ class LMCFlashAttnMetadata(LMCAttnMetadata):
         self.max_query_len = top_k_num
         self.query_start_loc = torch.tensor([0, top_k_num], dtype=q_dtype, device=device)
 
+    def truncate_keys(self, key_len: int):
+        """Set the causal key range for a contiguous query prefix."""
+        device = self.cu_seqlens_k.device
+        k_dtype = self.cu_seqlens_k.dtype
+        self.cu_seqlens_k = torch.tensor([0, key_len], dtype=k_dtype, device=device)
+        self.seq_lens = torch.tensor([key_len], device=self.seq_lens.device)
+        self.max_seq_len = key_len
+
 
 @dataclass
 class LMCFlashInferSparseMetadata(LMCAttnMetadata):

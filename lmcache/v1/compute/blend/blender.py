@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Optional, Sequence, Union, Any
+from typing import Any, Callable, Optional, Sequence, Union
 import os
 import time
 
@@ -9,10 +9,14 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.compute.attention.metadata import LMCAttnMetadata, LMCFlashAttnMetadata
+from lmcache.v1.compute.attention.metadata import LMCAttnMetadata
 from lmcache.v1.compute.blend.metadata import BLEND_MODES, LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.compute.models.utils import infer_model_from_vllm
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.retrieval_contract import (
+    expected_retrieval_count,
+    validate_retrieval_count,
+)
 
 logger = init_logger(__name__)
 
@@ -53,11 +57,9 @@ class LMCBlender:
         if not blend_mode:
             blend_mode = "codecsight" if config.is_codecsight else "topk"
         if blend_mode not in BLEND_MODES:
-            logger.warning(
-                "Unknown blend_mode '%s', falling back to 'direct_reuse'. "
-                "Valid modes: %s", blend_mode, BLEND_MODES,
+            raise ValueError(
+                f"Unknown blend_mode {blend_mode!r}; valid modes: {BLEND_MODES}"
             )
-            blend_mode = "direct_reuse"
         self.blend_mode = blend_mode
         self.gop = max(int(config.GOP), 1)
         self.vlcache_recompute_ratio = float(
@@ -80,14 +82,15 @@ class LMCBlender:
         )
         self.skip_ffn = False
         self.skip_ffn_only_codecsight = True
-        # When True, blend_mode direct_reuse only runs layerwise GPU retrieve
-        # (same KV load as enable_blending=False) and skips the redundant
-        # layerwise_model.compute_layer pass that recomputes attention/FFN.
+        # Direct reuse does not need a model recompute pass.
         self.direct_reuse_retrieve_only = True
+        self.exact_prefix_fast_path = (
+            os.environ.get("LMCACHE_EXACT_PREFIX_FAST_PATH", "1") != "0"
+        )
+        # Default refresh budget in frames.
+        self.codecsight_refresh_frames = 3
         self._single_zero_idx: dict[torch.device, torch.Tensor] = {}
-        # P2 ablation instrumentation (behind flags, default off -> no behavior change):
-        #  LMCACHE_TIME_SELECTION=1 -> log "SELECT_TIME mode=.. ms=.." per selection
-        #  LMCACHE_EQUAL_K=1        -> top-K refreshes the SAME #tokens as I-frame (equal-K)
+        # Optional ablation instrumentation.
         self._time_sel = os.environ.get("LMCACHE_TIME_SELECTION") == "1"
         self._equal_k = os.environ.get("LMCACHE_EQUAL_K") == "1"
         if config.extra_config is not None:
@@ -99,6 +102,18 @@ class LMCBlender:
                 self.direct_reuse_retrieve_only = bool(
                     config.extra_config.get("direct_reuse_retrieve_only", True)
                 )
+            self.codecsight_refresh_frames = int(
+                config.extra_config.get(
+                    "codecsight_refresh_frames",
+                    config.extra_config.get("codecsight_prefix_frames", 3),
+                )
+            )
+        if self.blend_mode == "codecsight":
+            logger.info(
+                "CodecSight selection: %s (refresh_frames=%d)",
+                "contiguous prefix of the reused span",
+                self.codecsight_refresh_frames,
+            )
         if self.skip_ffn:
             logger.warning(
                 "FFN skip is enabled (only_codecsight=%s). This may reduce output quality.",
@@ -111,9 +126,7 @@ class LMCBlender:
             attn_mask=None,
             positions=None,
         )
-        # Batch-safety: each blend() call installs its own per-request metadata
-        # here so concurrent requests in one prefill step do not clobber each
-        # other. Defaults to the shared instance for any non-blend path.
+        # blend() replaces this with request-local metadata.
         self._active_metadata = self.metadata
         self._rotary_by_layer = [
             self._get_rotary_emb(layer.self_attn) for layer in self.layers
@@ -135,8 +148,9 @@ class LMCBlender:
                 }
                 logger.info("mRoPE blender initialized with config: %s", self._mrope_model_config)
             except Exception as e:
-                logger.warning("Could not extract mRoPE config from model: %s", e)
-                self.is_mrope = False
+                raise RuntimeError(
+                    "Could not initialize exact mRoPE metadata for cache reuse"
+                ) from e
 
     def _get_rotary_emb(self, attn_layer):
         if hasattr(attn_layer, "rotary_emb"):
@@ -146,18 +160,13 @@ class LMCBlender:
         raise AttributeError("Attention layer does not expose rotary embedding module.")
 
     def _compute_mrope_positions(self, num_tokens: int, device: torch.device) -> torch.Tensor:
-        """Compute correct M-RoPE 3D positions for Qwen3-VL models.
-
-        Falls back to 1D arange if the required metadata is unavailable.
-        Returns a tensor of shape [3, num_tokens] for M-RoPE or [num_tokens] for 1D.
-        """
+        """Compute Qwen3-VL positions with shape [3, num_tokens]."""
         input_ids = self._active_metadata.input_ids
         image_grid_thw = self._active_metadata.image_grid_thw
         cfg = self._mrope_model_config
 
         if input_ids is None or cfg is None:
-            logger.warning("M-RoPE metadata missing; falling back to 1D positions.")
-            return torch.arange(num_tokens, device=device, dtype=torch.int64)
+            raise RuntimeError("M-RoPE input IDs or model metadata are missing")
 
         input_ids_for_pos = input_ids[:num_tokens]
 
@@ -169,27 +178,29 @@ class LMCBlender:
         if image_grid_thw is None:
             image_grid_thw = []
 
-        # Flatten nested grid lists: each image has [[t, h, w]]
-        flat_grid = []
-        for entry in image_grid_thw:
-            if isinstance(entry, (list, tuple)):
-                if len(entry) > 0 and isinstance(entry[0], (list, tuple)):
-                    flat_grid.extend(entry)
-                else:
-                    flat_grid.append(entry)
-            else:
-                flat_grid.append(entry)
+        # Accept nested and flattened vLLM grid metadata.
+        try:
+            grid_values = torch.as_tensor(image_grid_thw, dtype=torch.int64)
+            if grid_values.numel() % 3 != 0:
+                raise ValueError(
+                    f"image_grid_thw has {grid_values.numel()} values, not a multiple of 3"
+                )
+            flat_grid = grid_values.reshape(-1, 3).tolist()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise RuntimeError("Malformed image_grid_thw for mRoPE reuse") from exc
 
         input_tokens_tensor = torch.tensor(input_ids_for_pos)
         vision_start_indices = torch.argwhere(
             input_tokens_tensor == vision_start_token_id
         ).squeeze(1)
+        # Ignore a trailing vision-start marker with no placeholder token.
+        vision_start_indices = vision_start_indices[
+            vision_start_indices + 1 < input_tokens_tensor.numel()
+        ]
         vision_tokens = input_tokens_tensor[vision_start_indices + 1]
         image_nums = int((vision_tokens == image_token_id).sum())
         video_nums = int((vision_tokens == video_token_id).sum())
 
-        # For Qwen3-VL: video frames are sent as individual images, so
-        # video_grid_thw should be empty (each frame is an image entry).
         video_grid_thw_expanded: list = []
 
         llm_pos_ids_list: list = []
@@ -219,12 +230,10 @@ class LMCBlender:
                 if image_index < len(flat_grid):
                     t, h, w = flat_grid[image_index]
                 else:
-                    logger.warning(
-                        "image_grid_thw index %d out of range (len=%d); "
-                        "falling back to 1D positions.",
-                        image_index, len(flat_grid),
+                    raise RuntimeError(
+                        "image_grid_thw does not cover all image placeholders: "
+                        f"index={image_index}, grids={len(flat_grid)}"
                     )
-                    return torch.arange(num_tokens, device=device, dtype=torch.int64)
                 image_index += 1
                 remain_images -= 1
                 ed = ed_image
@@ -232,7 +241,10 @@ class LMCBlender:
                 if video_index < len(video_grid_thw_expanded):
                     t, h, w = video_grid_thw_expanded[video_index]
                 else:
-                    return torch.arange(num_tokens, device=device, dtype=torch.int64)
+                    raise RuntimeError(
+                        "video placeholder reached the image-path mRoPE cache "
+                        "implementation without video grid metadata"
+                    )
                 video_index += 1
                 remain_videos -= 1
                 ed = ed_video
@@ -293,10 +305,6 @@ class LMCBlender:
         positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
         return positions.to(device=device, dtype=torch.int64)
 
-    # ------------------------------------------------------------------
-    # Helpers shared by codecsight / vlcache selection paths
-    # ------------------------------------------------------------------
-
     def _compute_hit_indices(self, effective_len: int, device: torch.device):
         """Return indices of cache-*hit* tokens (excluding gaps)."""
         gap_positions = getattr(
@@ -319,55 +327,55 @@ class LMCBlender:
         effective_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """CodecSight I-frame selection using GOP / mm_positions."""
-        gop = self.gop
+        """Select a contiguous visual prefix for CodecSight refresh."""
+        return self._prefix_select(hit_indices, effective_len, device)
+
+    def _prefix_select(
+        self,
+        hit_indices: torch.Tensor,
+        effective_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Select the first N visual frames as one contiguous token run."""
+        n_frames = max(1, int(self.codecsight_refresh_frames))
+        hits = hit_indices[hit_indices < effective_len]
+        if hits.numel() == 0:
+            return hit_indices.new_empty((0,))
+
         tokens_per_frame = int(self._active_metadata.tokens_per_frame or 0)
         mm_positions: Optional[Sequence[Any]] = self._active_metadata.mm_positions
 
+        # Exclude cached template tokens from the refresh budget.
+        start = end = None
         if mm_positions:
-            selected_chunks: list[torch.Tensor] = []
-            first_key_start: Optional[int] = None
-            for frame_id, placeholder in enumerate(mm_positions):
-                start = int(getattr(placeholder, "offset", 0))
+            for placeholder in mm_positions:
+                off = int(getattr(placeholder, "offset", 0))
                 length = int(getattr(placeholder, "length", 0))
-                if length <= 0 or start >= effective_len:
+                if length <= 0 or off >= effective_len:
                     continue
-                end = min(start + length, effective_len)
-                if gop > 1 and (frame_id % gop) != 0:
-                    continue
-                if first_key_start is None:
-                    first_key_start = start
-                hit_in_range = hit_indices[
-                    (hit_indices >= start) & (hit_indices < end)
-                ]
-                if hit_in_range.numel() > 0:
-                    selected_chunks.append(hit_in_range)
+                if start is None:
+                    start = off
+                end = min(off + length, effective_len)
+                n_frames -= 1
+                if n_frames == 0:
+                    break
+        if start is None:
+            # Approximate the budget when placeholder metadata is absent.
+            per = tokens_per_frame if tokens_per_frame > 0 else 256
+            start = int(hits.min().item())
+            end = min(start + max(1, int(self.codecsight_refresh_frames)) * per,
+                      effective_len)
+            logger.warning_once(
+                "codecsight prefix selection has no mm_positions; anchoring the "
+                "prefix at the first cache hit, which may include prompt tokens."
+            ) if hasattr(logger, "warning_once") else logger.warning(
+                "codecsight prefix selection has no mm_positions; anchoring the "
+                "prefix at the first cache hit, which may include prompt tokens."
+            )
 
-            if selected_chunks:
-                selected = torch.cat(selected_chunks, dim=0)
-            else:
-                selected = hit_indices.new_empty((0,))
-            if selected.numel() == 0 and first_key_start is not None:
-                if first_key_start < effective_len:
-                    selected = torch.tensor(
-                        [first_key_start], device=device, dtype=torch.long
-                    )
-        elif tokens_per_frame > 0:
-            if gop > 1:
-                frame_ids = hit_indices // tokens_per_frame
-                selected = hit_indices[(frame_ids % gop) == 0]
-            else:
-                selected = hit_indices
-            if selected.numel() == 0 and hit_indices.numel() > 0:
-                selected = hit_indices[:1]
-            elif selected.numel() == 0:
-                selected = hit_indices
-        elif gop > 1:
-            selected = hit_indices[(hit_indices % gop) == 0]
-            if selected.numel() == 0 and hit_indices.numel() > 0:
-                selected = hit_indices[:1]
-        else:
-            selected = hit_indices
+        selected = hits[(hits >= start) & (hits < end)]
+        if selected.numel() == 0:
+            selected = hits[:1]
         return selected
 
     def _random_select(
@@ -376,12 +384,7 @@ class LMCBlender:
         effective_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Random-K control (P2 ablation): select the SAME NUMBER of tokens as
-        the I-frame (codecsight) strategy would, but at random positions among
-        the cache-hit tokens. Matched budget K isolates the I-frame *signal*
-        from the *amount* of recomputation. Deterministic via a fixed seed so
-        the ablation is reproducible.
-        """
+        """Select a deterministic random control with CodecSight's budget."""
         k = int(self._codecsight_select(hit_indices, effective_len, device).numel())
         n = int(hit_indices.numel())
         if k <= 0 or n == 0:
@@ -406,19 +409,16 @@ class LMCBlender:
         Two sub-modes controlled by ``self.vlcache_mode``:
           - ``per_frame``: floor(r * T_i) from each frame (paper-faithful)
           - ``prefix``:    first r% of all image tokens concatenated
-        Falls back to prefix-of-all-overlap when mm_positions is absent.
+        Requires multimodal positions so the configured VLCache strategy is
+        not silently replaced by a different selection policy.
         """
         mm_positions: Optional[Sequence[Any]] = self._active_metadata.mm_positions
         r = self.vlcache_recompute_ratio
 
         if not mm_positions:
-            logger.debug(
-                "vlcache: mm_positions unavailable, falling back to "
-                "prefix-of-all (effective_len=%d, r=%.4f)", effective_len, r,
-            )
-            prefix_len = max(1, int(effective_len * r))
-            return torch.arange(
-                min(prefix_len, effective_len), device=device, dtype=torch.long
+            raise RuntimeError(
+                "VLCache selection requires mm_positions; refusing a silent "
+                "prefix-of-all fallback"
             )
 
         logger.debug(
@@ -498,10 +498,6 @@ class LMCBlender:
         budget = max(1, int(all_image_t.numel() * r))
         return all_image_t[:budget]
 
-    # ------------------------------------------------------------------
-    # Shared logic: apply index selection + rotary for selective modes
-    # ------------------------------------------------------------------
-
     def _apply_selected_indices(
         self,
         selected_indices: torch.Tensor,
@@ -518,13 +514,7 @@ class LMCBlender:
         layer_id: int,
         mode_label: str,
     ):
-        """Build imp_indices on first layer, then apply per-layer.
-
-        Slices q/k/v/residual to the selected subset and updates
-        attn_metadata (query side only -- cu_seqlens_k stays at full
-        sequence length so the selected queries attend to the entire
-        cached KV context, matching the official lmcache behaviour).
-        """
+        """Apply the first layer's token selection to one decoder layer."""
         num_tokens = q.shape[0]
 
         if self._active_metadata.imp_indices is None:
@@ -577,7 +567,13 @@ class LMCBlender:
             and sel_eff_len == num_tokens
         )
         if not full_range:
-            attn_metadata.update_from_top_indices(layer_imp)
+            if self._contiguous_key_len(layer_imp) is None:
+                self._active_metadata.causal_blocks = self._causal_blocks(
+                    layer_imp
+                )
+            else:
+                self._active_metadata.causal_blocks = None
+                attn_metadata.update_from_top_indices(layer_imp)
             k = k.index_select(0, layer_imp)
             v = v.index_select(0, layer_imp)
             q = q.index_select(0, layer_imp)
@@ -588,11 +584,77 @@ class LMCBlender:
 
         old_k[layer_imp] = k
         old_v[layer_imp] = v
+
+        # Truncate keys so FlashAttention's causal alignment matches the prefix.
+        key_len = self._contiguous_key_len(layer_imp)
+        if key_len is not None and key_len < old_k.shape[0]:
+            attn_metadata.truncate_keys(key_len)
+            return (q, old_k[:key_len], old_v[:key_len], residual,
+                    attn_output, attn_metadata)
         return q, old_k, old_v, residual, attn_output, attn_metadata
 
-    # ------------------------------------------------------------------
-    # Main entry: process_qkv
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _causal_blocks(indices: torch.Tensor) -> list[tuple[int, int, int]]:
+        """Map consecutive absolute-token runs to query slices and key ends."""
+        if indices.numel() == 0:
+            return []
+        values = indices.tolist()
+        blocks: list[tuple[int, int, int]] = []
+        query_start = 0
+        run_start = 0
+        for cursor in range(1, len(values) + 1):
+            if cursor < len(values) and values[cursor] == values[cursor - 1] + 1:
+                continue
+            query_end = query_start + cursor - run_start
+            blocks.append((query_start, query_end, values[cursor - 1] + 1))
+            query_start = query_end
+            run_start = cursor
+        return blocks
+
+    def forward_attention(
+        self,
+        backend: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: LMCAttnMetadata,
+    ) -> torch.Tensor:
+        blocks = self._active_metadata.causal_blocks
+        if not blocks:
+            return backend.forward_contiguous(q, k, v, output, attn_metadata)
+        truncate_keys = getattr(attn_metadata, "truncate_keys", None)
+        if truncate_keys is None:
+            raise RuntimeError(
+                "scattered refresh requires blockwise causal attention metadata"
+            )
+        imp_indices = self._active_metadata.imp_indices
+        if imp_indices is None:
+            raise RuntimeError("causal attention blocks have no selected indices")
+        for query_start, query_end, key_end in blocks:
+            query_indices = imp_indices[query_start:query_end]
+            attn_metadata.update_from_top_indices(query_indices)
+            truncate_keys(key_end)
+            backend.forward_contiguous(
+                q[query_start:query_end],
+                k[:key_end],
+                v[:key_end],
+                output[query_start:query_end],
+                attn_metadata,
+            )
+        return output
+
+    @staticmethod
+    def _contiguous_key_len(idx: torch.Tensor) -> Optional[int]:
+        """Return a contiguous run's exclusive end, or None if scattered."""
+        n = int(idx.numel())
+        if n == 0:
+            return None
+        lo = int(idx[0].item())
+        hi = int(idx[-1].item())
+        if hi - lo + 1 != n:
+            return None
+        return hi + 1
 
     def process_qkv(
         self,
@@ -604,19 +666,14 @@ class LMCBlender:
         attn_output: Optional[torch.Tensor],
         attn_metadata: LMCAttnMetadata,
     ):
-        """Dispatch to the appropriate blend strategy based on ``blend_mode``.
-
-        Supported modes: direct_reuse, topk, codecsight, vlcache.
-        """
+        """Apply the configured cache-refresh strategy to one layer."""
         logger.debug("Blender is processing KV for layer %d", layer_id)
         try:
             old_k, old_v = self.gpu_connector.get_kv(layer_id)
-        except ValueError:
-            logger.warning(
-                "KV cache for layer %s is not loaded into GPU buffer, skip blending.",
-                layer_id,
-            )
-            return q, k, v, residual, attn_output, attn_metadata
+        except ValueError as exc:
+            raise RuntimeError(
+                f"KV cache for layer {layer_id} was not loaded"
+            ) from exc
 
         if attn_output is None:
             attn_output = torch.empty(
@@ -640,27 +697,20 @@ class LMCBlender:
 
         rotary = self._rotary_by_layer[layer_id]
 
-        # ==============================================================
-        # direct_reuse: no recomputation, just return cached KV
-        # ==============================================================
+        # Direct reuse performs only positional correction.
         if self.blend_mode == "direct_reuse":
             q, _ = rotary(self._active_metadata.positions, q, k)
             return q, old_k, old_v, residual, attn_output, attn_metadata
 
-        # ==============================================================
-        # topk: L2-diff based selection (original check_layers path)
-        #
-        # Matches the official lmcache approach: slice q/k/v to the
-        # selected subset but keep cu_seqlens_k at full sequence length
-        # so each selected query attends to the entire cached KV.
-        # ==============================================================
+        # CacheBlend selects tokens by K-vector divergence.
         if self.blend_mode == "topk":
             q, k = rotary(self._active_metadata.positions, q, k)
             write_indices = self._active_metadata.imp_indices
 
             if layer_id in self.common_metadata.check_layers:
                 if self._time_sel:
-                    torch.cuda.synchronize(); _t0 = time.perf_counter()
+                    torch.cuda.synchronize()
+                    _t0 = time.perf_counter()
                 diff_k = torch.sum(
                     (k.to(torch.float32) - old_k.to(torch.float32)) ** 2,
                     dim=[1],
@@ -699,12 +749,19 @@ class LMCBlender:
                 residual = residual[top_indices]
 
                 self._active_metadata.imp_indices = top_indices
+                if self._contiguous_key_len(top_indices) is None:
+                    self._active_metadata.causal_blocks = self._causal_blocks(
+                        top_indices
+                    )
+                else:
+                    self._active_metadata.causal_blocks = None
                 if self._active_metadata.positions.ndim == 2:
                     self._active_metadata.positions = self._active_metadata.positions[:, top_indices]
                 else:
                     self._active_metadata.positions = self._active_metadata.positions[top_indices]
                 attn_output = attn_output[:topk_num]
-                attn_metadata.update_from_top_indices(top_indices)
+                if self._active_metadata.causal_blocks is None:
+                    attn_metadata.update_from_top_indices(top_indices)
                 write_indices = top_indices
 
             if write_indices is not None:
@@ -713,25 +770,15 @@ class LMCBlender:
                 return q, old_k, old_v, residual, attn_output, attn_metadata
             return q, k, v, residual, attn_output, attn_metadata
 
-        # ==============================================================
-        # codecsight / vlcache: index-based selective recomputation
-        # ==============================================================
-        _MIN_BLEND_TOKENS = 128
+        # CodecSight and VLCache use explicit token indices.
         first_layer = self._active_metadata.imp_indices is None
 
         if first_layer:
             effective_len = min(q.shape[0], old_k.shape[0])
-            if effective_len < _MIN_BLEND_TOKENS:
-                logger.info(
-                    "Cached prefix too short (%d < %d tokens) for %s, "
-                    "falling back to direct_reuse",
-                    effective_len, _MIN_BLEND_TOKENS, self.blend_mode,
-                )
-                q, _ = rotary(self._active_metadata.positions, q, k)
-                return q, old_k, old_v, residual, attn_output, attn_metadata
             hit_indices = self._compute_hit_indices(effective_len, q.device)
             if self._time_sel:
-                torch.cuda.synchronize(); _t0 = time.perf_counter()
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
             if self.blend_mode == "codecsight":
                 selected = self._codecsight_select(
                     hit_indices, effective_len, q.device,
@@ -759,123 +806,23 @@ class LMCBlender:
         # the selected subset by compute_layer. Apply rotary and write
         # into the full KV cache at the stored indices.
         imp_indices = self._active_metadata.imp_indices
+        if imp_indices is None:
+            raise RuntimeError("selected-token metadata was lost between layers")
+        if (imp_indices.numel() > 0
+                and int(imp_indices[-1].item()) >= old_k.shape[0]):
+            raise RuntimeError(
+                f"layer {layer_id} KV length {old_k.shape[0]} does not cover "
+                f"selected token {int(imp_indices[-1].item())}"
+            )
         q, k = rotary(self._active_metadata.positions, q, k)
         old_k[imp_indices] = k
         old_v[imp_indices] = v
+        key_len = self._contiguous_key_len(imp_indices)
+        if key_len is not None and key_len < old_k.shape[0]:
+            attn_metadata.truncate_keys(key_len)
+            return (q, old_k[:key_len], old_v[:key_len], residual,
+                    attn_output, attn_metadata)
         return q, old_k, old_v, residual, attn_output, attn_metadata
-
-    # ------------------------------------------------------------------
-    # Tier-2: batched selective recompute (LMCACHE_BATCHED_BLEND=1)
-    # ------------------------------------------------------------------
-    def process_qkv_batched(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer_id: int,
-        req_meta: list,
-        kvcaches,
-        cu_q: torch.Tensor,
-    ):
-        """Batched counterpart to process_qkv for the packed anchor tensor.
-
-        RoPE is per-token (position-indexed), so it applies once on the packed
-        q/k with concatenated positions -- identical to per-segment. Then, per
-        request: scatter the freshly recomputed (RoPE'd) anchor K/V into the
-        paged cache, gather the request's full S-token context (now including
-        the fresh anchors), and concat across requests so attention sees one
-        contiguous [ΣS] key tensor with cu_seqlens_k marking the boundaries.
-
-        Returns (q_packed, packed_old_k, packed_old_v, attn_metadata).
-        """
-        rotary = self._rotary_by_layer[layer_id]
-
-        # packed positions across all requests (1D [ΣA] or mRoPE [3, ΣA])
-        pos0 = req_meta[0]["positions"]
-        if pos0.ndim == 2:
-            packed_pos = torch.cat([m["positions"] for m in req_meta], dim=1)
-        else:
-            packed_pos = torch.cat([m["positions"] for m in req_meta], dim=0)
-        q, k = rotary(packed_pos, q, k)
-
-        attn_core = self.layerwise_model.vllm_attn_layers[layer_id]
-        nkv = int(getattr(attn_core, "num_kv_heads", None)
-                  or getattr(attn_core, "num_key_value_heads"))
-        hd = int(getattr(attn_core, "head_size", None)
-                 or getattr(attn_core, "head_dim"))
-
-        k = k.view(-1, nkv, hd)
-        v = v.view(-1, nkv, hd)
-
-        kv = kvcaches[layer_id]
-        # flash-attn paged layout: [2, num_blocks, block_size, nkv, hd] (two-major)
-        two_major = kv.shape[0] == 2
-        if two_major:
-            k_all = kv[0].view(-1, nkv, hd)
-            v_all = kv[1].view(-1, nkv, hd)
-        else:  # flash-infer: [num_blocks, 2, block_size, nkv, hd]
-            k_all = kv[:, 0].reshape(-1, nkv, hd)
-            v_all = kv[:, 1].reshape(-1, nkv, hd)
-
-        old_k_segs, old_v_segs, S_list = [], [], []
-        for i, m in enumerate(req_meta):
-            a0, a1 = int(cu_q[i]), int(cu_q[i + 1])
-            slot_full = m["slot_full"]
-            anchor_local = m["anchor_local"]
-            anchor_slots = slot_full[anchor_local]
-            # scatter fresh anchor K/V into the paged cache (refresh the cache)
-            k_all[anchor_slots] = k[a0:a1]
-            v_all[anchor_slots] = v[a0:a1]
-            # gather full context (now includes the fresh anchors)
-            old_k_segs.append(k_all[slot_full])
-            old_v_segs.append(v_all[slot_full])
-            S_list.append(slot_full.shape[0])
-
-        packed_old_k = torch.cat(old_k_segs, dim=0)
-        packed_old_v = torch.cat(old_v_segs, dim=0)
-
-        dev = q.device
-        cu_k = torch.tensor(
-            [0] + list(torch.tensor(S_list).cumsum(0)),
-            dtype=torch.int32, device=dev,
-        )
-        attn_metadata = LMCFlashAttnMetadata(
-            query_start_loc=cu_q.to(torch.int32),
-            seq_lens=torch.tensor(S_list, device=dev),
-            cu_seqlens_k=cu_k,
-            max_query_len=int((cu_q[1:] - cu_q[:-1]).max()),
-            max_seq_len=max(S_list),
-        )
-        return q, packed_old_k, packed_old_v, attn_metadata
-
-    def blend_batched(self, requests: list, kvcaches):
-        """Orchestrate batched selective recompute for N requests in one forward.
-
-        `requests`: list of per-request dicts, each with:
-          - 'anchor_embeds': [A, hidden] embeddings of the anchor tokens
-          - 'positions':      anchor RoPE positions, [A] or [3, A]
-          - 'slot_full':       paged-cache flat slots for all S cached tokens, [S]
-          - 'anchor_local':    anchor indices within 0..S, [A]
-        Phase-1 (load + RoPE-correct each request's full cached KV into the paged
-        cache) must already have run -- this drives only the packed recompute.
-        Drains the compute fully (eager); returns None.
-        """
-        logger.info("blend_batched: packing %d request(s), total anchors=%d",
-                    len(requests),
-                    sum(int(r["anchor_local"].numel()) for r in requests))
-        packed_embeds = torch.cat([r["anchor_embeds"] for r in requests], dim=0)
-        req_meta = [
-            {"positions": r["positions"],
-             "slot_full": r["slot_full"],
-             "anchor_local": r["anchor_local"]}
-            for r in requests
-        ]
-        gen = self.layerwise_model.compute_layer_batched(
-            packed_embeds, req_meta, kvcaches,
-        )
-        for _ in range(self.num_layers):
-            next(gen)
-        return None
 
     # NOTE(Jiayi): Exposing this `blend_layer` interface as we might
     # want to orchestrate the blending process elsewhere
@@ -889,13 +836,23 @@ class LMCBlender:
         Perform layerwise retrieve + blending.
         """
         # TODO(Jiayi): store is currently not included in this function
-        # Capture this request's metadata; re-installed before each per-layer
-        # step below so interleaved concurrent generators (batched prefill in
-        # the deferred/async path) never read each other's selection state.
         md = self._active_metadata
         check_layers = self.common_metadata.check_layers
         inputs_embeds = kwargs.pop("inputs_embeds", None)
         deepstack_input_embeds = kwargs.pop("deepstack_input_embeds", None)
+        embedding_provider: Optional[
+            Callable[[], tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]
+        ] = kwargs.pop("embedding_provider", None)
+        model_input_ids = kwargs.pop("model_input_ids", tokens)
+        # Cache token IDs may contain hash sentinels; the model needs originals.
+        if not torch.is_tensor(model_input_ids):
+            model_input_ids = torch.tensor(
+                model_input_ids,
+                dtype=torch.long,
+                device=tokens.device,
+            )
+        elif model_input_ids.device != tokens.device:
+            model_input_ids = model_input_ids.to(device=tokens.device)
         layerwise_retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
 
         # warmup retriever
@@ -906,6 +863,14 @@ class LMCBlender:
                 has_retrieved_tokens = int(warmup_retrieved.item()) > 0
             else:
                 has_retrieved_tokens = int(warmup_retrieved) > 0
+
+        expected_retrieved = expected_retrieval_count(mask, len(tokens))
+        validate_retrieval_count(
+            expected=expected_retrieved,
+            actual=warmup_retrieved,
+            request_id=kwargs.get("req_id"),
+            path=f"blend:{self.blend_mode}",
+        )
         yield
 
         if not has_retrieved_tokens:
@@ -931,14 +896,40 @@ class LMCBlender:
             yield
             return
 
-        layerwise_model_executor = self.layerwise_model.compute_layer(
-            check_layers, tokens,
-            inputs_embeds=inputs_embeds,
-            deepstack_input_embeds=deepstack_input_embeds,
-        )
-        for _ in range(self.num_layers):
+        layerwise_model_executor = None
+        for layer_id in range(self.num_layers):
             self._active_metadata = md
             next(layerwise_retriever)
+            if (
+                layer_id == 0
+                and getattr(self, "exact_prefix_fast_path", True)
+                and getattr(
+                    self.gpu_connector, "current_exact_prefix_match", False
+                )
+            ):
+                logger.info(
+                    "%s: exact-prefix reuse (skip positional repair and "
+                    "selective recompute)",
+                    self.blend_mode,
+                )
+                yield
+                for _ in range(1, self.num_layers):
+                    next(layerwise_retriever)
+                    yield
+                next(layerwise_retriever)
+                md.clean()
+                yield
+                return
+
+            if layerwise_model_executor is None:
+                if embedding_provider is not None:
+                    inputs_embeds, deepstack_input_embeds = embedding_provider()
+                layerwise_model_executor = self.layerwise_model.compute_layer(
+                    check_layers,
+                    model_input_ids,
+                    inputs_embeds=inputs_embeds,
+                    deepstack_input_embeds=deepstack_input_embeds,
+                )
             next(layerwise_model_executor)
             yield
 
@@ -951,26 +942,13 @@ class LMCBlender:
         self,
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
-        defer: bool = False,
         **kwargs,
     ):
-        """
-        Perform blending for the given tokens.
-
-        If ``defer`` is True, prime the layerwise generator (filling the
-        internal load pipeline, mirroring retrieve_layer's 2x prime) and
-        RETURN it instead of draining it. The caller then steps it once per
-        decoder layer from ``wait_for_layer_load`` so the per-layer KV load
-        overlaps the previous layer's prefill compute. Returns None in the
-        eager path.
-        """
+        """Retrieve and refresh the selected cached tokens eagerly."""
 
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens).cuda()
-        logger.info("enter blend (defer=%s)", defer)
-        # Per-request metadata: isolate this request's blend state so concurrent
-        # requests batched in the same prefill step cannot collide on shared
-        # state. blend_layer re-installs this before each layer step.
+        logger.info("enter blend")
         md = LMCBlendMetadata(imp_indices=None, attn_mask=None, positions=None)
         self._active_metadata = md
         tokens_per_frame = kwargs.get("tokens_per_frame")
@@ -982,22 +960,14 @@ class LMCBlender:
         image_grid_thw = kwargs.get("image_grid_thw")
         if image_grid_thw is not None:
             self._active_metadata.image_grid_thw = image_grid_thw
-        if isinstance(tokens, torch.Tensor):
-            self._active_metadata.input_ids = tokens.tolist()
+        model_input_ids = kwargs.get("model_input_ids", tokens)
+        if isinstance(model_input_ids, torch.Tensor):
+            self._active_metadata.input_ids = model_input_ids.tolist()
         else:
-            self._active_metadata.input_ids = list(tokens)
+            self._active_metadata.input_ids = list(model_input_ids)
 
         layerwise_blender = self.blend_layer(tokens, mask, **kwargs)
-
-        if defer:
-            # Prime twice to fill the 3-stage load pipeline (same count as the
-            # non-blend retrieve_layer deferral). The remaining num_layers
-            # steps are driven by wait_for_layer_load during the forward.
-            next(layerwise_blender)
-            next(layerwise_blender)
-            return layerwise_blender
-
-        # +2 is for the handshake/closing process with the retriever at both the beginning and end.
+        # Two extra yields open and close the layerwise retrieval pipeline.
         for _ in range(self.num_layers + 2):
             next(layerwise_blender)
         return None

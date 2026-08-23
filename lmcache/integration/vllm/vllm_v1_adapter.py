@@ -3,8 +3,8 @@
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
-import contextlib
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -50,6 +50,7 @@ from lmcache.integration.vllm.utils import (
     lmcache_get_or_create_config,
     mla_enabled,
 )
+from lmcache.integration.vllm.kv_diagnostics import KVDiagnostic
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
@@ -70,6 +71,10 @@ from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
 from lmcache.v1.plugin.plugin_launcher import PluginLauncher
 from lmcache.v1.compute.models.utils import VLLMModelTracker
+from lmcache.v1.retrieval_contract import (
+    expected_retrieval_count,
+    validate_retrieval_count,
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -306,6 +311,8 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
+    # Token IDs before cache-key sentinels are applied.
+    model_token_ids: list[int]
     # Slot mapping
     slot_mapping: torch.Tensor
 
@@ -402,6 +409,7 @@ class ReqMeta:
 
         # Calculate the token ids and slot mappings for load and save
         token_ids = input_token_ids[:num_tokens_to_save]
+        model_token_ids = token_ids.copy()
 
         # If the request has multimodal hashes, apply them to the token ids
         if tracker.mm_hashes:
@@ -459,6 +467,7 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
+            model_token_ids=model_token_ids,
             slot_mapping=slot_mapping,
             is_last_prefill=is_last_prefill,
             save_spec=save_spec,
@@ -470,6 +479,38 @@ class ReqMeta:
             mm_hashes=tracker.mm_hashes,
             image_grid_thw=tracker.image_grid_thw,
         )
+
+
+@dataclass(frozen=True)
+class EmbeddingReconstructionResult:
+    """Outcome of rebuilding embeddings for selective KV refresh."""
+
+    inputs_embeds: Optional[torch.Tensor]
+    deepstack_input_embeds: Optional[torch.Tensor]
+    status: str
+    detail: str = ""
+
+    @property
+    def ready(self) -> bool:
+        return self.status == "ready"
+
+    @property
+    def no_visual_prefix(self) -> bool:
+        return self.status == "no_visual_prefix"
+
+
+def _has_visual_prefix(
+    mm_hashes: Optional[list[str]],
+    mm_positions: Optional[list["PlaceholderRange"]],
+    num_tokens: int,
+) -> bool:
+    if not mm_hashes or not mm_positions:
+        return False
+    return any(
+        int(getattr(placeholder, "length", 0)) > 0
+        and int(getattr(placeholder, "offset", 0)) < num_tokens
+        for _, placeholder in zip(mm_hashes, mm_positions, strict=False)
+    )
 
 
 def need_gpu_interm_buffer(lmcache_config: LMCacheEngineConfig):
@@ -684,32 +725,22 @@ class LMCacheConnectorV1Impl:
         self.layerwise_retrievers: list[
             Generator[Optional[torch.Tensor], None, None]
         ] = []
-        # Deferred codecsight blenders (pipelining A): stepped per-layer from
-        # wait_for_layer_load so the per-layer KV load overlaps prefill.
-        self.layerwise_blenders: list[
-            Generator[None, None, None]
-        ] = []
-        self._codecsight_pipeline = (
-            os.environ.get("VLLM_CODECSIGHT_PIPELINE", "0") == "1"
-        )
-        # Async overlap prototype: run the deferred blender on a side CUDA
-        # stream one layer ahead so blend(L+1)'s recompute overlaps prefill(L).
-        # Implies the deferred-blender path. Requires the gpu_connector's
-        # per-layer global sync to be scoped (gated on the same env var).
-        self._async_overlap = (
-            os.environ.get("VLLM_CODECSIGHT_ASYNC_OVERLAP", "0") == "1"
-        )
-        if self._async_overlap:
-            self._codecsight_pipeline = True
-        # Tier-2: batched selective recompute -- gather all blend requests in a
-        # step and recompute their anchor tokens in ONE packed forward instead
-        # of N serial forwards. Default off => existing serial path unchanged.
-        # See codecsight-bench/TIER2_BATCHED_BLEND.md.
-        self._batched_blend = (
-            os.environ.get("LMCACHE_BATCHED_BLEND", "0") == "1"
-        )
-        self._blend_stream = None  # lazily created (needs CUDA device)
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self._log_writeback_timing = (
+            os.environ.get("LMCACHE_LOG_WRITEBACK_TIMING", "0") == "1"
+        )
+        self._writeback_inline_seconds = 0.0
+        self._writeback_started_at: Optional[float] = None
+        self._kv_diag = KVDiagnostic(
+            vllm_config.model_config.get_num_layers(
+                vllm_config.parallel_config
+            ),
+            vllm_config.parallel_config.rank,
+        )
+        self._kv_diag_force_miss = (
+            os.environ.get("LMCACHE_KV_DIAG_FORCE_MISS", "0") == "1"
+        )
+        self._layerwise_load_requests: list[ReqMeta] = []
         if role == KVConnectorRole.SCHEDULER:
             self.lmcache_engine: Optional[LMCacheEngine] = None
             # Check if bypass lookup is enabled for scheduler
@@ -792,9 +823,6 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
 
         self._requests_priority: dict[str, int] = {}
-
-        # Track block IDs associated with failed load attempts.
-        self._invalid_block_ids: set[int] = set()
 
         # TODO(baoloongmao): Internal api server & plugin framework support dp > 1
         if vllm_config.parallel_config.data_parallel_rank_local == 0:
@@ -1003,55 +1031,61 @@ class LMCacheConnectorV1Impl:
         mm_hashes: Optional[list[str]],
         mm_positions: Optional[list["PlaceholderRange"]],
         num_tokens: int,
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Reconstruct ``inputs_embeds`` (and optionally Deepstack embeds)
-        for the cached prefix of a request by looking up the ViT encoder
-        outputs stored in vLLM's ``encoder_cache``.
-
-        Returns ``(inputs_embeds, deepstack_input_embeds)`` or
-        ``(None, None)`` when the cache is unavailable.
-        """
+    ) -> EmbeddingReconstructionResult:
+        """Rebuild a cached prefix's multimodal input embeddings."""
         if not mm_hashes or not mm_positions:
-            return None, None
+            return EmbeddingReconstructionResult(
+                None, None, "no_visual_prefix",
+                "request has no multimodal metadata",
+            )
+
+        visual_items = []
+        for mm_hash, placeholder in zip(mm_hashes, mm_positions):
+            start = int(getattr(placeholder, "offset", 0))
+            length = int(getattr(placeholder, "length", 0))
+            if length <= 0 or start >= num_tokens:
+                continue
+            visual_items.append((mm_hash, placeholder))
+        if not visual_items:
+            return EmbeddingReconstructionResult(
+                None, None, "no_visual_prefix",
+                f"cached prefix of {num_tokens} tokens contains no visual span",
+            )
 
         try:
             vllm_model = VLLMModelTracker.get_model(ENGINE_NAME)
-        except (ValueError, KeyError):
-            return None, None
+        except (ValueError, KeyError) as exc:
+            return EmbeddingReconstructionResult(
+                None, None, "model_unavailable", str(exc),
+            )
 
         encoder_cache = VLLMModelTracker.get_encoder_cache(ENGINE_NAME)
         if encoder_cache is None:
             logger.warning(
                 "encoder_cache not registered; vision token recompute disabled"
             )
-            return None, None
+            return EmbeddingReconstructionResult(
+                None, None, "encoder_cache_unavailable",
+                "encoder_cache is not registered",
+            )
 
         token_ids_t = torch.tensor(
             token_ids[:num_tokens], dtype=torch.long, device="cuda"
         )
-        # Incomplete cached prefix: under high-concurrency KV pressure vLLM can
-        # preempt/evict part (or all) of a request's cached tokens, so the
-        # available token_ids are fewer than the expected num_tokens. Downstream
-        # scatter/blend still clips with num_tokens, overrunning the shorter
-        # [have, hidden] tensor -> empty: token_ids_t.min() raised (N>=16);
-        # partial: "mask [num_tokens] vs tensor [have]" IndexError (N=12). Both
-        # killed the whole EngineCore. A partial prefix can't be blended
-        # faithfully anyway, so abort and fall back to layerwise retrieval --
-        # the same safe path as the encoder-miss guards below.
+        # Selective refresh requires embeddings for the entire cached prefix.
         if token_ids_t.shape[0] < num_tokens:
-            logger.warning(
-                "Cached prefix incomplete (%d of %d expected tokens present; "
-                "preempted/evicted under load); aborting blend, falling back "
-                "to layerwise retrieval.", int(token_ids_t.shape[0]), num_tokens,
+            detail = (
+                f"cached prefix incomplete: have {int(token_ids_t.shape[0])} "
+                f"of {num_tokens} expected tokens"
             )
-            return None, None
+            return EmbeddingReconstructionResult(
+                None, None, "incomplete_prefix", detail,
+            )
 
-        # Collect vision embeddings that fall within the cached prefix.
-        # Use None as sentinel for encoder_cache misses so that the list
-        # stays aligned 1:1 with the mm_positions that pass the filter.
+        # Preserve one entry per visual span, including cache misses.
         vision_embeds: list[Optional[torch.Tensor]] = []
         num_encoder_misses = 0
-        for mm_hash, placeholder in zip(mm_hashes, mm_positions):
+        for mm_hash, placeholder in visual_items:
             start = int(getattr(placeholder, "offset", 0))
             length = int(getattr(placeholder, "length", 0))
             if length <= 0 or start >= num_tokens:
@@ -1072,31 +1106,29 @@ class LMCacheConnectorV1Impl:
                     torch.as_tensor(enc_out), end - start)
             vision_embeds.append(enc_slice)
         if num_encoder_misses > 0:
-            logger.warning(
-                "encoder_cache missed %d/%d items in cached prefix "
-                "(evicted before blending); aborting blend, falling "
-                "back to layerwise retrieval for correctness",
-                num_encoder_misses, len(vision_embeds),
+            return EmbeddingReconstructionResult(
+                None,
+                None,
+                "encoder_cache_miss",
+                f"missed {num_encoder_misses}/{len(vision_embeds)} visual items",
             )
-            return None, None
 
         if not any(ve is not None for ve in vision_embeds):
-            logger.warning(
-                "No vision embeds found from encoder_cache "
-                "(mm_hashes=%d, mm_positions=%d, num_tokens=%d)",
-                len(mm_hashes), len(mm_positions), num_tokens,
+            return EmbeddingReconstructionResult(
+                None, None, "encoder_cache_miss",
+                "no visual embeddings were found for visual spans in prefix",
             )
-            return None, None
 
-        # Build text embeddings then overlay vision embeddings directly
-        # using mm_positions (not placeholder token ID matching, because
-        # token_ids may have been rewritten with content hashes).
+        # Content-hash sentinels make mm_positions the authoritative layout.
         lang_model = getattr(vllm_model, "language_model", vllm_model)
         embed_fn = getattr(lang_model, "get_input_embeddings", None)
         if embed_fn is None:
             embed_fn = getattr(lang_model, "embed_tokens", None)
         if embed_fn is None:
-            return None, None
+            return EmbeddingReconstructionResult(
+                None, None, "embedding_api_unavailable",
+                "model exposes neither get_input_embeddings nor embed_tokens",
+            )
 
         text_embeds = embed_fn(token_ids_t)
         text_has_nan = bool(torch.isnan(text_embeds).any())
@@ -1108,9 +1140,7 @@ class LMCacheConnectorV1Impl:
             token_ids_t.min().item(), token_ids_t.max().item(),
         )
 
-        # --- Deepstack (Qwen3-VL): encoder_cache stores concatenated
-        # [main | multiscale] embeddings whose dim > text hidden size.
-        # Split via _compute_deepstack_embeds before scattering. ----------
+        # Qwen3-VL caches main and DeepStack features in one tensor.
         deepstack_input_embeds: Optional[torch.Tensor] = None
         compute_deepstack = getattr(vllm_model, "_compute_deepstack_embeds", None)
         use_deepstack = getattr(vllm_model, "use_deepstack", False)
@@ -1118,9 +1148,7 @@ class LMCacheConnectorV1Impl:
         multiscale_dim = int(getattr(vllm_model, "multiscale_dim", 0))
         expected_mm_dim = visual_dim + multiscale_dim
 
-        # Qwen codec path may append 4 mRoPE channels to cached vision embeds.
-        # Strip these channels before deepstack split / scatter reconstruction.
-        # None entries (encoder_cache misses) are preserved for alignment.
+        # Codec metadata may append four mRoPE channels.
         vision_embeds_norm: list[Optional[torch.Tensor]] = []
         for ve in vision_embeds:
             if ve is None:
@@ -1140,21 +1168,40 @@ class LMCacheConnectorV1Impl:
         vision_embeds = vision_embeds_norm
         if use_deepstack and compute_deepstack is not None:
             try:
-                # If cache provides full [main|multiscale], use model split path.
-                ds_embeds, vision_embeds_main = compute_deepstack(
-                    token_ids_t, text_embeds, vision_embeds,
-                )
+                # Split [main | level0 | ...] before scattering by mm_positions.
+                if expected_mm_dim <= 0:
+                    raise ValueError("invalid Qwen DeepStack dimensions")
+                vision_embeds_main = [
+                    ve[:, :visual_dim] if ve is not None else None
+                    for ve in vision_embeds
+                ]
                 inputs_embeds = self._scatter_vision_embeds(
                     text_embeds, vision_embeds_main, mm_positions, num_tokens,
                 )
-                deepstack_input_embeds = ds_embeds
-                return inputs_embeds, deepstack_input_embeds
+                level_embeds = []
+                for level in range(int(getattr(vllm_model, "deepstack_num_level", 0))):
+                    lo = visual_dim * (level + 1)
+                    hi = lo + visual_dim
+                    per_level = [
+                        ve[:, lo:hi] if ve is not None else None
+                        for ve in vision_embeds
+                    ]
+                    level_embeds.append(self._scatter_vision_embeds(
+                        text_embeds.new_zeros(text_embeds.shape), per_level,
+                        mm_positions, num_tokens,
+                    ))
+                if not level_embeds:
+                    raise ValueError("Qwen DeepStack reports zero levels")
+                deepstack_input_embeds = torch.stack(level_embeds, dim=0)
+                return EmbeddingReconstructionResult(
+                    inputs_embeds, deepstack_input_embeds, "ready",
+                )
             except Exception as exc:
-                logger.warning("Deepstack reconstruction failed: %s", exc)
+                return EmbeddingReconstructionResult(
+                    None, None, "deepstack_failure", str(exc),
+                )
 
-        # Fallback: ensure scatter dims match language hidden size.
-        # If cache carries concatenated [main|multiscale], keep main slice only.
-        # None entries (encoder_cache misses) are preserved for alignment.
+        # Non-DeepStack models consume only the language-width feature slice.
         hidden = text_embeds.shape[-1]
         vision_embeds_scatter: list[Optional[torch.Tensor]] = []
         for idx, ve in enumerate(vision_embeds):
@@ -1167,113 +1214,91 @@ class LMCacheConnectorV1Impl:
             if expected_mm_dim > 0 and ve.shape[-1] == expected_mm_dim:
                 vision_embeds_scatter.append(ve[:, :hidden])
                 continue
-            if ve.shape[-1] > hidden:
-                logger.warning(
-                    "Fallback scatter: truncating cached vision dim %d -> %d "
-                    "(item %d)",
-                    ve.shape[-1], hidden, idx,
-                )
-                vision_embeds_scatter.append(ve[:, :hidden])
-            else:
-                logger.warning(
-                    "Fallback scatter: cached vision dim %d < hidden %d "
-                    "(item %d); skipping this embed",
-                    ve.shape[-1], hidden, idx,
-                )
+            return EmbeddingReconstructionResult(
+                None,
+                None,
+                "embedding_shape_mismatch",
+                f"visual item {idx} has dim {ve.shape[-1]}, expected {hidden}",
+            )
 
-        # --- Standard path (InternVL, etc.): encoder_cache dim matches
-        # text hidden size. Scatter directly. --------------------------
         inputs_embeds = self._scatter_vision_embeds(
             text_embeds, vision_embeds_scatter, mm_positions, num_tokens,
         )
-        return inputs_embeds, deepstack_input_embeds
+        return EmbeddingReconstructionResult(
+            inputs_embeds, deepstack_input_embeds, "ready",
+        )
 
-    def _batched_blend_load_kv(self, metadata, kvcaches, attn_metadata) -> bool:
-        """Tier-2 batched selective recompute (LMCACHE_BATCHED_BLEND=1).
+    def _compute_request_cache_positions(
+        self,
+        request: ReqMeta,
+        num_tokens: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Return exact three-axis positions for an mRoPE cache hit."""
+        self._ensure_blender_initialized()
+        if self.blender is None or not self.blender.is_mrope:
+            return None
 
-        Two phases (see codecsight-bench/TIER2_BATCHED_BLEND.md):
-          Phase 1 (per request, memory-only): a plain ``retrieve_layer`` loads +
-            RoPE-corrects each request's full cached KV into the paged cache,
-            and (via the gpu_connector) records its gap positions; we then run
-            the codec I-frame selection and gather anchor embeds/positions/slots.
-          Phase 2 (one packed forward): ``blender.blend_batched`` recomputes all
-            requests' anchor tokens together and scatters refreshed K/V back.
-
-        Returns True if the batched path handled the step; False to fall back to
-        the serial loop (any precondition miss => safe fallback, no degradation).
-        """
         # First Party
         from lmcache.v1.compute.blend.metadata import LMCBlendMetadata
 
-        blender = self.blender
-        if blender is None:
-            return False
-
-        requests_info = []
-        chunk = self._lmcache_chunk_size
-        for request in metadata.requests:
-            if request.load_spec is None:
-                continue
-            tokens = request.token_ids
-            slot_mapping = request.slot_mapping.cuda()
-            if len(tokens) != len(slot_mapping):
-                return False
-            c = min(request.load_spec.lmcache_cached_tokens, len(tokens))
-            if c < 128:  # _MIN_BLEND_TOKENS: too short to blend -> fall back
-                return False
-
-            token_mask = torch.ones(len(tokens), dtype=torch.bool)
-            masked = request.load_spec.vllm_cached_tokens // chunk * chunk
-            token_mask[:masked] = False
-
-            embeds, _deepstack = self._reconstruct_inputs_embeds(
-                tokens, request.mm_hashes, request.mm_positions, c,
+        md = LMCBlendMetadata(
+            imp_indices=None, attn_mask=None, positions=None,
+        )
+        md.input_ids = list(request.model_token_ids[:num_tokens])
+        md.mm_positions = request.mm_positions
+        md.image_grid_thw = request.image_grid_thw
+        previous_md = self.blender._active_metadata
+        try:
+            self.blender._active_metadata = md
+            positions = self.blender._compute_mrope_positions(
+                num_tokens, device,
             )
-            if embeds is None:
-                return False  # encoder cache unavailable -> serial fallback
+        finally:
+            self.blender._active_metadata = previous_md
 
-            # Phase 1: plain retrieve -> paged cache (load + RoPE-correct),
-            # synchronous so gap_positions + paged KV are ready before selection.
-            retr = self.lmcache_engine.retrieve_layer(
-                tokens[:c], token_mask[:c], kvcaches=kvcaches,
-                slot_mapping=slot_mapping[:c], sync=True,
+        if positions.ndim != 2 or positions.shape[0] != 3:
+            raise RuntimeError(
+                "Qwen mRoPE cache reuse requires exact [3, num_tokens] "
+                "positions; refusing the unsafe 1D fallback."
             )
-            for _ in retr:
-                pass
+        return positions
 
-            # Selection: install this request's metadata, run codec I-frame pick.
-            md = LMCBlendMetadata(imp_indices=None, attn_mask=None, positions=None)
-            md.tokens_per_frame = int(request.tokens_per_frame or 0)
-            md.mm_positions = request.mm_positions
-            md.image_grid_thw = request.image_grid_thw
-            md.input_ids = list(tokens[:c])
-            blender._active_metadata = md
-
-            dev = slot_mapping.device
-            hit = blender._compute_hit_indices(c, dev)
-            anchor_local = blender._codecsight_select(hit, c, dev)
-            if anchor_local.numel() == 0:
-                return False
-
-            if blender.is_mrope and blender._mrope_model_config is not None:
-                positions_full = blender._compute_mrope_positions(c, dev)
-                positions = positions_full[:, anchor_local]
-            else:
-                positions = torch.arange(c, device=dev, dtype=torch.int64)[anchor_local]
-
-            requests_info.append({
-                "anchor_embeds": embeds[anchor_local],
-                "positions": positions,
-                "slot_full": slot_mapping[:c],
-                "anchor_local": anchor_local,
-            })
-
-        if not requests_info:
-            return False
-
-        # Phase 2: one packed forward for all requests.
-        blender.blend_batched(requests_info, kvcaches)
-        return True
+    def _start_checked_layerwise_retrieval(
+        self,
+        *,
+        request_id: str,
+        tokens: list[int],
+        mask: torch.Tensor,
+        kvcaches,
+        slot_mapping: torch.Tensor,
+        sync: bool,
+        cache_positions: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        path: str,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """Prime layerwise retrieval and verify the scheduler's promise once."""
+        assert self.lmcache_engine is not None
+        retriever = self.lmcache_engine.retrieve_layer(
+            tokens,
+            mask,
+            kvcaches=kvcaches,
+            slot_mapping=slot_mapping,
+            sync=sync,
+            cache_positions=cache_positions,
+            request_configs=request_configs,
+            req_id=request_id,
+        )
+        retrieved_count = next(retriever)
+        validate_retrieval_count(
+            expected=expected_retrieval_count(mask, len(tokens)),
+            actual=retrieved_count,
+            request_id=request_id,
+            path=path,
+        )
+        # Prime the layerwise pipeline.
+        next(retriever)
+        return retriever
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -1309,23 +1334,7 @@ class LMCacheConnectorV1Impl:
         self.lmcache_engine.post_init(kvcaches=kvcaches)
 
         self.layerwise_retrievers = []
-        self.layerwise_blenders = []
-
-        # Tier-2: batched selective recompute. Eligible only for the eager
-        # codecsight blend path (the validated batch-safe mode). Falls through
-        # to the serial loop on any miss so behavior is never silently degraded.
-        if (
-            self._batched_blend
-            and self.use_layerwise
-            and self.enable_blending
-            and not self._codecsight_pipeline
-            and getattr(self.blender, "blend_mode", "") == "codecsight"
-        ):
-            handled = self._batched_blend_load_kv(
-                metadata, kvcaches, attn_metadata,
-            )
-            if handled:
-                return
+        self._layerwise_load_requests = []
 
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None:
@@ -1338,6 +1347,7 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
+            model_tokens = request.model_token_ids or tokens
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.cuda()
             assert len(tokens) == len(slot_mapping)
@@ -1350,46 +1360,37 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
-            # Clamp to the request's ACTUAL available tokens. Under high-N KV
-            # pressure load_spec.lmcache_cached_tokens can exceed len(tokens)
-            # (part of the cached prefix was preempted/evicted), and every
-            # downstream slice [:lmcache_cached_tokens] then overran the shorter
-            # tensors -> EngineCore crash (empty min() at N>=16; partial-prefix
-            # IndexError at N=12). Clamping keeps the blend CONSISTENT on the
-            # surviving prefix (reuse what's cached, let vLLM recompute the
-            # evicted tail) instead of aborting -- preserves throughput at high N.
-            # No-op in the normal case (cached prefix <= full request length).
-            lmcache_cached_tokens = min(
-                request.load_spec.lmcache_cached_tokens, len(tokens)
+            # vLLM has already skipped the advertised cache-hit prefix.
+            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            if lmcache_cached_tokens > len(tokens):
+                raise RuntimeError(
+                    "LMCache scheduled more cached tokens than the worker "
+                    f"received ({lmcache_cached_tokens} > {len(tokens)}); "
+                    "refusing silent partial-prefix execution."
+                )
+            cache_positions = self._compute_request_cache_positions(
+                request, lmcache_cached_tokens, slot_mapping.device,
             )
-            logger.debug(f"enter self.enable_blending {self.enable_blending}, self.use_layerwise {self.use_layerwise}")
+            logger.debug(
+                "start_load_kv: blending=%s, layerwise=%s",
+                self.enable_blending,
+                self.use_layerwise,
+            )
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
                 else:
                     sync = False
-                # NOTE(Jiayi): Perform blending before layerwise prefix caching
-                logger.debug(f"self.enable_blending {self.enable_blending}")
+                logger.debug("start_load_kv: blending=%s", self.enable_blending)
                 if self.enable_blending:
                     self._ensure_blender_initialized()
                     if self.blender is None:
-                        logger.warning(
-                            "Blender unavailable; falling back to layerwise retrieve."
+                        raise RuntimeError(
+                            "LMCache blending was requested but the blender is "
+                            f"unavailable for request={request.req_id}; refusing "
+                            "to silently execute a different cache strategy."
                         )
-                        self.enable_blending = False
-                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                            tokens[:lmcache_cached_tokens],
-                            token_mask[:lmcache_cached_tokens],
-                            kvcaches=kvcaches,
-                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                            sync=sync,
-                        )
-                        next(layerwise_retriever)
-                        next(layerwise_retriever)
-                        self.layerwise_retrievers.append(layerwise_retriever)
-                        continue
 
-                    # TODO(Jiayi): Need to make prefix caching and blending compatible
                     page_stream = self.lmcache_engine.gpu_connector.get_page_stream()
 
                     skip_embeds = (
@@ -1397,88 +1398,115 @@ class LMCacheConnectorV1Impl:
                         and getattr(
                             self.blender, "direct_reuse_retrieve_only", False)
                     )
-                    if skip_embeds:
-                        inputs_embeds, deepstack_input_embeds = None, None
-                    else:
-                        inputs_embeds, deepstack_input_embeds = (
-                            self._reconstruct_inputs_embeds(
-                                tokens, request.mm_hashes,
-                                request.mm_positions, lmcache_cached_tokens,
+                    embedding_provider = None
+                    if not skip_embeds:
+                        if not _has_visual_prefix(
+                            request.mm_hashes,
+                            request.mm_positions,
+                            lmcache_cached_tokens,
+                        ):
+                            logger.info(
+                                "LMCache cache strategy no-op: request=%s, "
+                                "requested_mode=%s, executed_mode=direct_reuse, "
+                                "reason=no_visual_prefix, cached_tokens=%d",
+                                request.req_id,
+                                getattr(self.blender, "blend_mode", "unknown"),
+                                lmcache_cached_tokens,
                             )
-                        )
+                            layerwise_retriever = (
+                                self._start_checked_layerwise_retrieval(
+                                    request_id=request.req_id,
+                                    tokens=tokens[:lmcache_cached_tokens],
+                                    mask=token_mask[:lmcache_cached_tokens],
+                                    kvcaches=kvcaches,
+                                    slot_mapping=slot_mapping[
+                                        :lmcache_cached_tokens],
+                                    sync=sync,
+                                    cache_positions=cache_positions,
+                                    request_configs=request.request_configs,
+                                    path="no_visual_prefix",
+                                )
+                            )
+                            self.layerwise_retrievers.append(
+                                layerwise_retriever)
+                            self._layerwise_load_requests.append(request)
+                            continue
 
-                    if inputs_embeds is None and not skip_embeds:
-                        logger.warning(
-                            "inputs_embeds unavailable (encoder_cache "
-                            "eviction); falling back to layerwise "
-                            "retrieval for this request"
-                        )
-                        layerwise_retriever = \
-                            self.lmcache_engine.retrieve_layer(
-                                tokens[:lmcache_cached_tokens],
-                                token_mask[:lmcache_cached_tokens],
-                                kvcaches=kvcaches,
-                                slot_mapping=slot_mapping[
-                                    :lmcache_cached_tokens],
-                                sync=sync,
+                        def embedding_provider(
+                            model_tokens=model_tokens,
+                            mm_hashes=request.mm_hashes,
+                            mm_positions=request.mm_positions,
+                            num_tokens=lmcache_cached_tokens,
+                            request_id=request.req_id,
+                        ):
+                            reconstruction = self._reconstruct_inputs_embeds(
+                                model_tokens,
+                                mm_hashes,
+                                mm_positions,
+                                num_tokens,
                             )
-                        next(layerwise_retriever)
-                        next(layerwise_retriever)
-                        self.layerwise_retrievers.append(
-                            layerwise_retriever)
-                        continue
+                            if not reconstruction.ready:
+                                raise RuntimeError(
+                                    "LMCache selective refresh cannot "
+                                    "reconstruct visual embeddings: "
+                                    f"request={request_id}, "
+                                    f"status={reconstruction.status}, "
+                                    f"detail={reconstruction.detail}. "
+                                    "Refusing to silently execute direct reuse."
+                                )
+                            assert reconstruction.inputs_embeds is not None
+                            return (
+                                reconstruction.inputs_embeds,
+                                reconstruction.deepstack_input_embeds,
+                            )
 
                     logger.debug(
-                        "start_load_kv: inputs_embeds=%s, "
-                        "deepstack=%s, mm_hashes=%d, mm_positions=%d, "
+                        "start_load_kv: embedding_reconstruction=%s, "
+                        "mm_hashes=%d, mm_positions=%d, "
                         "cached_tokens=%d",
-                        inputs_embeds.shape if inputs_embeds is not None else None,
-                        deepstack_input_embeds.shape if deepstack_input_embeds is not None else None,
+                        "deferred" if embedding_provider is not None else "skipped",
                         len(request.mm_hashes) if request.mm_hashes else 0,
                         len(request.mm_positions) if request.mm_positions else 0,
                         lmcache_cached_tokens,
                     )
 
-                    if self._async_overlap and self._blend_stream is None:
-                        self._blend_stream = torch.cuda.Stream()
-                    # Async overlap: prime the deferred blender ON the side
-                    # stream so layer-0's blend runs there (one layer ahead).
-                    _blend_ctx = (
-                        torch.cuda.stream(self._blend_stream)
-                        if self._async_overlap
-                        else contextlib.nullcontext()
-                    )
-                    with _blend_ctx:
-                        deferred_blender = self.blender.blend(
-                            tokens[:lmcache_cached_tokens],
-                            token_mask[:lmcache_cached_tokens],
-                            defer=self._codecsight_pipeline,
-                            kvcaches=kvcaches,
-                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                            tokens_per_frame=request.tokens_per_frame,
-                            mm_positions=request.mm_positions,
-                            image_grid_thw=request.image_grid_thw,
-                            page_stream=page_stream,
-                            sync=sync,
-                            inputs_embeds=inputs_embeds,
-                            deepstack_input_embeds=deepstack_input_embeds,
-                        )
-                    if deferred_blender is not None:
-                        # Pipelining A: step per-layer in wait_for_layer_load
-                        # so the KV load overlaps prefill compute.
-                        self.layerwise_blenders.append(deferred_blender)
-                else:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                    self.blender.blend(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        tokens_per_frame=request.tokens_per_frame,
+                        mm_positions=request.mm_positions,
+                        image_grid_thw=request.image_grid_thw,
+                        model_input_ids=model_tokens[:lmcache_cached_tokens],
+                        cache_positions=cache_positions,
+                        request_configs=request.request_configs,
+                        page_stream=page_stream,
                         sync=sync,
+                        embedding_provider=embedding_provider,
+                        req_id=request.req_id,
                     )
-                    # NOTE: retrieve for two layers at the first layer
-                    next(layerwise_retriever)
-                    next(layerwise_retriever)
+                    for layer_id, (layer_name, kv_layer) in enumerate(
+                        self.kv_caches.items()
+                    ):
+                        self._kv_diag.capture(
+                            "prepared", layer_id, layer_name, kv_layer,
+                            request, lmcache_cached_tokens,
+                        )
+                else:
+                    layerwise_retriever = self._start_checked_layerwise_retrieval(
+                        request_id=request.req_id,
+                        tokens=tokens[:lmcache_cached_tokens],
+                        mask=token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        sync=sync,
+                        cache_positions=cache_positions,
+                        request_configs=request.request_configs,
+                        path="plain_layerwise",
+                    )
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    self._layerwise_load_requests.append(request)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
@@ -1491,109 +1519,27 @@ class LMCacheConnectorV1Impl:
                 )
 
                 # Check the result
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                num_expected_tokens = (
-                    lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
-                )
-                if num_retrieved_tokens < num_expected_tokens:
-                    logger.error(
-                        "The number of retrieved tokens is less than the "
-                        "expected number of tokens! This should not happen!"
-                    )
-                    logger.error(
-                        "Num retrieved tokens: %d, num expected tokens: %d",
-                        num_retrieved_tokens,
-                        num_expected_tokens,
-                    )
-                    """
-                    Report failed block IDs in case of partial failure.
-                    """
-                    missing_blocks = self.record_failed_blocks(
-                        request.req_id,
+                validate_retrieval_count(
+                    expected=expected_retrieval_count(
                         token_mask[:lmcache_cached_tokens],
-                        ret_token_mask,
-                        slot_mapping[:lmcache_cached_tokens],
+                        lmcache_cached_tokens,
+                    ),
+                    actual=ret_token_mask,
+                    request_id=request.req_id,
+                    path="non_layerwise",
+                )
+                for layer_id, (layer_name, kv_layer) in enumerate(
+                    self.kv_caches.items()
+                ):
+                    self._kv_diag.capture(
+                        "prepared", layer_id, layer_name, kv_layer,
+                        request, lmcache_cached_tokens,
                     )
-                    self._invalid_block_ids.update(missing_blocks)
 
             self._stats_monitor.update_interval_vllm_hit_tokens(
                 request.load_spec.vllm_cached_tokens
             )
             self._stats_monitor.update_interval_prompt_tokens(len(tokens))
-
-    def record_failed_blocks(
-        self,
-        request_id: str,
-        expected_mask: torch.Tensor,
-        ret_mask: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> set[int]:
-        """Record block IDs associated with failed load attempts.
-
-        Args:
-            request_id: request id from vLLM.
-            expected_mask: Boolean tensor indicating which tokens were expected to
-                be loaded from LMCache. True means the token should be loaded,
-                False means the token is already cached in vLLM and does not need
-                to be loaded from LMCache.
-            ret_mask: Boolean tensor indicating which tokens were actually
-                successfully retrieved from LMCache. True means the token was
-                successfully loaded. For example, if 256 tokens are expected to be
-                loaded, but only 192 tokens are successfully loaded, then the
-                ret_mask will be a tensor of 256 items like [T, T, ..., F, F, ...]
-                where the first 192 elements are True and the last 64 elements
-                are False.
-            slot_mapping: Tensor indicating slot IDs for each token. The block
-                ID is computed by dividing the slot ID by the block size.
-
-        Example:
-            expected_mask = [F, T, T, T] meaning the 1st is in vLLM cache
-            ret_mask = [F, T, F, F] meaning failure from loading the 3rd
-            missing_mask = expected_mask & ~ret_mask = [F, F, T, T]
-            missing_indices = [2, 3]
-            then missing_blocks is calculated from slot_mapping and missing_indices
-
-        Returns:
-            set[int]: Set of block IDs that failed to load.
-        """
-
-        if expected_mask.numel() == 0:
-            return set()
-
-        expected_mask_cpu = expected_mask.to(device="cpu", dtype=torch.bool)
-        ret_mask_cpu = ret_mask.to(device="cpu", dtype=torch.bool)
-
-        if ret_mask_cpu.shape[0] != expected_mask_cpu.shape[0]:
-            logger.debug("expected_mask_cpu.shape[0] != ret_mask_cpu.shape[0]")
-            return set()
-
-        missing_mask = expected_mask_cpu & ~ret_mask_cpu
-        if not torch.any(missing_mask):
-            return set()
-
-        missing_indices = torch.nonzero(missing_mask, as_tuple=False).view(-1)
-        if missing_indices.numel() == 0:
-            return set()
-
-        slot_mapping_cpu = slot_mapping.to(device="cpu", dtype=torch.long)
-        if slot_mapping_cpu.shape[0] > missing_mask.shape[0]:
-            slot_mapping_cpu = slot_mapping_cpu[: missing_mask.shape[0]]
-
-        missing_blocks_tensor = torch.unique(
-            slot_mapping_cpu[missing_indices] // self._block_size
-        )
-        missing_blocks = {int(block.item()) for block in missing_blocks_tensor}
-
-        if not missing_blocks:
-            return set()
-
-        logger.warning(
-            "Request %s failed to load %d tokens across %d blocks",
-            request_id,
-            missing_indices.numel(),
-            len(missing_blocks),
-        )
-        return missing_blocks
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -1609,29 +1555,27 @@ class LMCacheConnectorV1Impl:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
         # Wait for the layer to be loaded
-        for layerwise_retriever in self.layerwise_retrievers:
+        for request, layerwise_retriever in zip(
+            self._layerwise_load_requests,
+            self.layerwise_retrievers,
+            strict=True,
+        ):
             ret_token_mask = next(layerwise_retriever)
+
+            if self.current_layer < len(self.kv_caches):
+                layer_name_at_index, kv_layer = list(
+                    self.kv_caches.items()
+                )[self.current_layer]
+                self._kv_diag.capture(
+                    "prepared", self.current_layer, layer_name_at_index,
+                    kv_layer, request,
+                    request.load_spec.lmcache_cached_tokens,
+                )
 
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.debug(f"Retrieved {num_retrieved_tokens} tokens")
-
-        # Pipelining A / async overlap: step deferred codecsight blenders one
-        # layer at a time. blend_layer yields None each step (no token mask).
-        if self._async_overlap and self.layerwise_blenders:
-            # The blender is one layer ahead (2x prime). At this hook for
-            # prefill layer L, blend(L) was already issued on the side stream
-            # last call; make the current (prefill) stream wait for it, then
-            # issue blend(L+1) on the side stream so it overlaps prefill(L).
-            cur = torch.cuda.current_stream()
-            cur.wait_stream(self._blend_stream)
-            with torch.cuda.stream(self._blend_stream):
-                for layerwise_blender in self.layerwise_blenders:
-                    next(layerwise_blender)
-        else:
-            for layerwise_blender in self.layerwise_blenders:
-                next(layerwise_blender)
 
         return
 
@@ -1669,11 +1613,18 @@ class LMCacheConnectorV1Impl:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
+        for request in connector_metadata.requests:
+            self._kv_diag.capture(
+                "final", self.current_layer, layer_name, kv_layer, request
+            )
+
         assert len(self.kv_caches) > 0
 
         kvcaches = list(self.kv_caches.values())
         if self.current_layer == 0:
             self.layerwise_storers = []
+            self._writeback_inline_seconds = 0.0
+            self._writeback_started_at = time.perf_counter()
 
             is_first = True
 
@@ -1728,13 +1679,19 @@ class LMCacheConnectorV1Impl:
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
                     sync=is_first,
+                    cache_positions=self._compute_request_cache_positions(
+                        request, len(token_ids), slot_mapping.device,
+                    ),
+                    request_configs=request.request_configs,
                 )
                 self.layerwise_storers.append(layerwise_storer)
                 if is_first:
                     is_first = False
 
+        inline_start = time.perf_counter()
         for layerwise_storer in self.layerwise_storers:
             next(layerwise_storer)
+        self._writeback_inline_seconds += time.perf_counter() - inline_start
 
         self.current_layer += 1
 
@@ -1749,11 +1706,25 @@ class LMCacheConnectorV1Impl:
             # Don't do save if the role is kv_consumer
             return
 
-        # logger.info("Waiting for saving KV caches to LMCache, kv_role=%s, and "
-                    # "use_layerwise=%s", self.kv_role, self.use_layerwise)
         if self.use_layerwise:
+            tail_start = time.perf_counter()
             for layerwise_storer in self.layerwise_storers:
                 next(layerwise_storer)
+            tail_seconds = time.perf_counter() - tail_start
+
+            if self._log_writeback_timing and self._writeback_started_at is not None:
+                elapsed_seconds = time.perf_counter() - self._writeback_started_at
+                logger.info(
+                    "LMCache write-back critical path: inline=%.3f ms, "
+                    "tail_wait=%.3f ms, synchronous_total=%.3f ms, "
+                    "forward_overlap_window=%.3f ms, requests=%d",
+                    self._writeback_inline_seconds * 1000,
+                    tail_seconds * 1000,
+                    (self._writeback_inline_seconds + tail_seconds) * 1000,
+                    elapsed_seconds * 1000,
+                    len(self.layerwise_storers),
+                )
+            self._writeback_started_at = None
 
             # unpin the kv caches according to req_id
             for request in connector_metadata.requests:
@@ -1848,9 +1819,7 @@ class LMCacheConnectorV1Impl:
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        invalid_blocks = self._invalid_block_ids.copy()
-        self._invalid_block_ids.clear()
-        return invalid_blocks
+        return set()
 
     ###################
     # Scheduler side APIs
@@ -1881,13 +1850,18 @@ class LMCacheConnectorV1Impl:
 
         self._requests_priority[request.request_id] = getattr(request, "priority", 0)
 
+        if self._kv_diag_force_miss:
+            logger.info(
+                "KV diagnostic forced miss for request %s",
+                request.request_id,
+            )
+            return 0
+
         token_ids = request.prompt_token_ids
 
         # If the request has multimodal hashes, apply them to the token ids
         mm_hashes, mm_positions = extract_mm_features(request)
         if mm_hashes and mm_positions:
-            # logger.info("Applying multimodal hashes to token ids for request %s, mm_hashes: %s, mm_positions: %s",
-                        #  request.request_id, mm_hashes, mm_positions)
             # TODO(Jiayi): Optimize this
             token_ids = torch.tensor(request.prompt_token_ids)
             apply_mm_hashes_to_token_ids(token_ids, mm_hashes, mm_positions)

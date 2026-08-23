@@ -544,17 +544,20 @@ def _validate_config(self):
         if self.local_cpu:
             logger.warning("local_gpu=True forces local_cpu=False")
             self.local_cpu = False
-        if (
-            self.local_disk
-            or self.remote_url is not None
-            or self.gds_path is not None
-            or self.weka_path is not None
-            or self.enable_p2p
-            or self.enable_pd
-            or enable_nixl_storage
-        ):
-            logger.warning(
-                "local_gpu=True ignores other storage backends and PD/P2P settings"
+        incompatible = {
+            "local_disk": self.local_disk,
+            "remote_url": self.remote_url is not None,
+            "gds_path": self.gds_path is not None,
+            "weka_path": self.weka_path is not None,
+            "enable_p2p": self.enable_p2p,
+            "enable_pd": self.enable_pd,
+            "enable_nixl_storage": bool(enable_nixl_storage),
+        }
+        conflicts = [name for name, enabled in incompatible.items() if enabled]
+        if conflicts:
+            raise ValueError(
+                "local_gpu=True is an exclusive storage mode and cannot be "
+                f"combined with: {', '.join(conflicts)}"
             )
     if self.enable_pd:
         assert self.pd_role is not None

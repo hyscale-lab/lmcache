@@ -71,12 +71,14 @@ class FusedRope:
     def fused_encode(self, old_positions, new_positions, k):
         num_tokens = k.shape[0]
         k = k.view(num_tokens, -1, self.head_size)
+        # The extension requires K and the RoPE cache to share a dtype.
+        cos_sin_cache = self.cos_sin_cache.to(device=k.device, dtype=k.dtype)
         lmc_ops.rotary_embedding_k_fused(
             old_positions,
             new_positions,
             k,
             self.head_size,
-            self.cos_sin_cache.to(k.device),
+            cos_sin_cache,
             self.is_neox_style,
         )
         k = k.view(num_tokens, -1)
@@ -113,12 +115,14 @@ def validate_rope_params(
     return True
 
 
-def validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size) -> bool:
+def validate_reverse_correctness(
+    rope, reverse_rope, fused_rope, head_size, dtype: torch.dtype
+) -> bool:
     hidden_dim = head_size * 8
     num_tokens = 10
 
-    dumb_q = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    dumb_k = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
+    dumb_q = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=dtype)
+    dumb_k = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=dtype)
     positions = torch.arange(num_tokens, device="cuda")
 
     q1 = dumb_q.clone()
@@ -143,9 +147,31 @@ def validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size) -> b
 
     max_k_error_fused = (k_pos2 - k_pos2_fused).abs().max()
 
-    logger.info(f"Max K error (fused): {max_k_error.item()}")
+    logger.info(f"Max K error (fused): {max_k_error_fused.item()}")
 
     return max_q_error < 0.1 and max_k_error < 0.1 and max_k_error_fused < 0.1
+
+
+def get_fused_rope_from_vllm(rope) -> Optional[Callable[..., Any]]:
+    """Build the relocation kernel from the model's actual RoPE cache."""
+    head_size = rope.head_size
+    rotary_dim = rope.rotary_dim
+    if rotary_dim != head_size:
+        logger.error("Currently KV blending only supports full rotary dimensions.")
+        return None
+
+    is_neox_style = rope.is_neox_style
+    reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)
+    fused_rope = FusedRope(rope, is_neox_style)
+    dtype = getattr(rope, "dtype", rope.cos_sin_cache.dtype)
+    if not validate_reverse_correctness(
+        rope, reverse_rope, fused_rope, head_size, dtype
+    ):
+        logger.error(
+            "The model RoPE and fused relocation kernel disagree; disabling blending."
+        )
+        return None
+    return fused_rope
 
 
 # Main interface
@@ -189,7 +215,10 @@ def get_fused_rope(
     reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)
     fused_rope = FusedRope(rope, is_neox_style)
 
-    correct = validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size)
+    validation_dtype = dtype or rope.cos_sin_cache.dtype
+    correct = validate_reverse_correctness(
+        rope, reverse_rope, fused_rope, head_size, validation_dtype
+    )
     if not correct:
         logger.error(
             "Fused/reverse rotary encoding is not correct! Will disable blending!"

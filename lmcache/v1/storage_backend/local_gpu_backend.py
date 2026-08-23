@@ -83,6 +83,31 @@ class LocalGPUBackend(AllocatorBackendInterface):
                 self.keys_in_request.append(key)
             return True
 
+    def support_batched_contains(self) -> bool:
+        return True
+
+    def batched_contains(
+        self,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+        stop_after_first_not_exits: bool = True,
+    ) -> List[bool]:
+        """Check a layer group under one GPU-cache lock acquisition."""
+        results: List[bool] = []
+        with self.gpu_lock:
+            for idx, key in enumerate(keys):
+                if key not in self.hot_cache:
+                    results.append(False)
+                    if stop_after_first_not_exits:
+                        results.extend([False] * (len(keys) - idx - 1))
+                        break
+                    continue
+                if pin:
+                    self.hot_cache[key].pin()
+                    self.keys_in_request.append(key)
+                results.append(True)
+        return results
+
     def touch_cache(self):
         with self.gpu_lock:
             for key in reversed(self.keys_in_request):
@@ -412,5 +437,5 @@ class LocalGPUBackend(AllocatorBackendInterface):
         return self.memory_allocator
 
     def close(self) -> None:
-        self.memory_allocator.close()
         self.clear()
+        self.memory_allocator.close()

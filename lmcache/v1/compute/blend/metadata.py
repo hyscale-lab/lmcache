@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Any
+from typing import Any, List, Optional, Sequence, Tuple
 
 # Third Party
 import torch
@@ -36,6 +36,7 @@ class LMCBlendMetadata:
     is_full_selection: bool = False
     image_grid_thw: Optional[List[List[int]]] = None
     input_ids: Optional[List[int]] = None
+    causal_blocks: Optional[List[Tuple[int, int, int]]] = None
 
     def clean(self):
         self.imp_indices = None
@@ -47,3 +48,4 @@ class LMCBlendMetadata:
         self.is_full_selection = False
         self.image_grid_thw = None
         self.input_ids = None
+        self.causal_blocks = None

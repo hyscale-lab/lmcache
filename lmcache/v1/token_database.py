@@ -319,22 +319,17 @@ class SegmentTokenDatabase(TokenDatabase):
 
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
 
-        # TODO (Jiayi): figure out how to decide when
-        # to use `1:` (whether there's a special starting token
-        # in the beginning)
-        self.sep_tokens = self.tokenizer.encode(config.blend_special_str)[1:]
+        # Encode the separator independently of BOS behavior.
+        self.sep_tokens = self.tokenizer.encode(
+            config.blend_special_str, add_special_tokens=False
+        )
         self.sep_tokens = torch.tensor(self.sep_tokens, device="cpu")
         self.sep_len = len(self.sep_tokens)
 
     def _fast_split_by_subtensor(
         self, tokens: torch.Tensor, skip_last: bool = False,
     ) -> Iterable[torch.Tensor]:
-        """Match the `sep_tokens` with sliding windows.
-
-        When *skip_last* is True the trailing chunk (after the final
-        separator) is omitted.  This prevents caching the question-text
-        segment whose positional encoding differs across sliding windows.
-        """
+        """Split into contiguous segments ending at each separator."""
 
         if self.sep_len == 0 or len(tokens) < self.sep_len:
             yield tokens
@@ -349,11 +344,12 @@ class SegmentTokenDatabase(TokenDatabase):
             (windows == self.sep_tokens).all(dim=1).nonzero(as_tuple=True)[0].tolist()
         )
 
-        # Split based on matches
+        # Attach each separator to the preceding segment.
         start = 0
         for idx in matches:
-            yield tokens[start:idx]
-            start = idx + self.sep_len
+            end = idx + self.sep_len
+            yield tokens[start:end]
+            start = end
         # Yield trailing chunk only when skip_last is False
         if not skip_last:
             yield tokens[start:]
@@ -423,16 +419,24 @@ class SegmentTokenDatabase(TokenDatabase):
                 tokens, skip_last=skip_last_segment,
             )
             start_idx = 0
-            for idx, token_chunk in enumerate(token_chunks):
+            for token_chunk in token_chunks:
                 token_chunk_len = len(token_chunk)
                 end_idx = start_idx + token_chunk_len
-                logger.debug(f"token_chunk_len: {token_chunk_len}, start_idx: {start_idx}, end_idx: {end_idx}, mask num_falses: {num_falses}") 
-                if idx > 0:
-                    start_idx += self.sep_len
-                    end_idx += self.sep_len
+                logger.debug(
+                    "token chunk: len=%d, start=%d, end=%d, masked=%d",
+                    token_chunk_len,
+                    start_idx,
+                    end_idx,
+                    num_falses,
+                )
                 if start_idx >= num_falses:
                     if make_key:
-                        logger.debug(f"Making key for tokens from {start_idx} to {end_idx}, chunk_len {token_chunk_len}, self._hash_tokens: {self._hash_tokens(token_chunk)}")
+                        logger.debug(
+                            "making cache key: start=%d, end=%d, len=%d",
+                            start_idx,
+                            end_idx,
+                            token_chunk_len,
+                        )
                         yield (
                             start_idx,
                             end_idx,

@@ -13,7 +13,9 @@ from typing import (
 )
 import asyncio
 import gc
+import hashlib
 import multiprocessing
+import os
 import time
 
 # Third Party
@@ -52,6 +54,47 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+
+
+def _prefix_context_hashes(
+    tokens: Union[torch.Tensor, list[int]],
+    ends: list[int],
+) -> list[bytes]:
+    """Return deterministic token-prefix digests at the requested boundaries."""
+    if not ends:
+        return []
+    token_tensor = torch.as_tensor(
+        tokens, dtype=torch.int64, device="cpu",
+    ).contiguous()
+    if ends != sorted(ends) or ends[-1] > len(token_tensor):
+        raise ValueError("context-hash boundaries must be sorted and in range")
+
+    digest = hashlib.sha256()
+    hashes: list[bytes] = []
+    cursor = 0
+    for end in ends:
+        digest.update(token_tensor[cursor:end].numpy().tobytes())
+        hashes.append(digest.digest())
+        cursor = end
+    return hashes
+
+
+def _classify_layer_group(storage_manager, layer_keys):
+    """Classify a layer group as absent, partial, or complete."""
+    if hasattr(storage_manager, "batched_get_locations"):
+        locations = storage_manager.batched_get_locations(layer_keys)
+    else:
+        # Compatibility with storage managers lacking the batched API.
+        locations = [storage_manager.contains(key) for key in layer_keys]
+    present_locations = [location for location in locations if location is not None]
+    if not present_locations:
+        return "absent", locations
+    if (
+        len(present_locations) == len(layer_keys)
+        and len(set(present_locations)) == 1
+    ):
+        return "complete", locations
+    return "partial", locations
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -375,9 +418,25 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(keys_multi_layer[0]):
+            group_state, layer_locations = _classify_layer_group(
+                self.storage_manager, keys_multi_layer
+            )
+            if group_state == "complete":
                 continue
+            if group_state == "partial":
+                # Fill missing layers instead of treating layer 0 as committed.
+                found = sum(location is not None for location in layer_locations)
+                logger.warning(
+                    "Repairing partial layerwise KV group: %d/%d layers "
+                    "present across locations=%s",
+                    found,
+                    len(keys_multi_layer),
+                    sorted({
+                        location
+                        for location in layer_locations
+                        if location is not None
+                    }),
+                )
 
             # Allocate the memory object
             num_tokens = end - start
@@ -419,8 +478,12 @@ class LMCacheEngine:
                 ),
             )
 
+            transfer_kwargs = dict(kwargs)
+            transfer_kwargs["cache_context_hashes"] = _prefix_context_hashes(
+                tokens, ends,
+            )
             mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs, starts, ends, **kwargs
+                memory_objs, starts, ends, **transfer_kwargs
             )
 
             next(mem_obj_generator)
@@ -588,7 +651,10 @@ class LMCacheEngine:
         gpu_start_event = None
         gpu_end_event = None
         timing_stream = None
-        if torch.cuda.is_available():
+        profile_retrieval = (
+            os.environ.get("LMCACHE_PROFILE_RETRIEVAL", "0") == "1"
+        )
+        if profile_retrieval and torch.cuda.is_available():
             gpu_start_event = torch.cuda.Event(enable_timing=True)
             gpu_end_event = torch.cuda.Event(enable_timing=True)
             timing_stream = (
@@ -671,7 +737,9 @@ class LMCacheEngine:
             #     keys_layer_major,
             #     location=location,
             # )
-            get_generator = self.storage_manager.layerwise_batched_get_sync(keys_layer_major)
+            get_generator = self.storage_manager.layerwise_batched_get_sync(
+                keys_layer_major, location=location,
+            )
 
             assert isinstance(
                 self.gpu_connector,
@@ -681,12 +749,19 @@ class LMCacheEngine:
                     SGLangLayerwiseGPUConnector,
                 ),
             )
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+            transfer_kwargs = dict(kwargs)
+            transfer_kwargs["cache_context_hashes"] = _prefix_context_hashes(
+                tokens, ends,
+            )
+            mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                starts, ends, **transfer_kwargs
+            )
             next(mem_obj_consumer)
 
             to_count_down = []
             per_layer_timing = (
-                torch.cuda.is_available()
+                profile_retrieval
+                and torch.cuda.is_available()
                 and self.gpu_connector is not None
                 and hasattr(self.gpu_connector, "load_stream")
             )
@@ -766,12 +841,22 @@ class LMCacheEngine:
             gpu_end_event.record(timing_stream)
             gpu_end_event.synchronize()
             elapsed_ms = gpu_start_event.elapsed_time(gpu_end_event)
-        logger.info(
-            f"Retrieved {retrieved_tokens} "
-            f"out of {num_required_tokens} "
-            f"out of total {len(tokens)} tokens. "
-            f"retrieve_layer gpu cost {elapsed_ms:.3f} ms"
-        )
+        if elapsed_ms is not None:
+            logger.info(
+                "Retrieved %s out of %s out of total %s tokens; "
+                "retrieve_layer GPU cost %.3f ms",
+                retrieved_tokens,
+                num_required_tokens,
+                len(tokens),
+                elapsed_ms,
+            )
+        else:
+            logger.debug(
+                "Retrieved %s out of %s out of total %s tokens",
+                retrieved_tokens,
+                num_required_tokens,
+                len(tokens),
+            )
 
         yield ret_mask
 
@@ -831,9 +916,8 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
+                lookup_location = None
                 for start, end, key in chunk_info_iterator:
-                    if start == 0: continue
-                    # logger.info(f"Looking up start={start}, end={end}, key={key}")
                     assert isinstance(key, CacheEngineKey)
 
                     # TODO(Jiayi): Optimize by checking only the existence of the key
@@ -841,14 +925,33 @@ class LMCacheEngine:
                     key_all_layers = key.split_layers(self.num_layers)
 
                     all_layers_found = True
+                    layer_location = None
+                    pinned_this_key = []
                     for key_single_layer in key_all_layers:
-                        # logger.info(f"Looking up single layer key={key_single_layer}, search_range={search_range}, pin={pin}")
-                        if not self.storage_manager.contains(
+                        found_location = self.storage_manager.contains(
                             key_single_layer, search_range, pin
-                        ):
+                        )
+                        if not found_location:
                             all_layers_found = False
                             break
+                        if pin:
+                            pinned_this_key.append(key_single_layer)
+                        if layer_location is None:
+                            layer_location = found_location
+                        elif layer_location != found_location:
+                            # A layer group must come from one backend.
+                            all_layers_found = False
+                            break
+                    if (
+                        all_layers_found
+                        and lookup_location is not None
+                        and layer_location != lookup_location
+                    ):
+                        # One retrieve request has one backend location.
+                        all_layers_found = False
                     if all_layers_found:
+                        if lookup_location is None:
+                            lookup_location = layer_location
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
@@ -860,6 +963,9 @@ class LMCacheEngine:
                         total_hit_tokens += end - start
                         logger.debug(f"Hit: start={start}, end={end}, key={key}")
                         continue
+                    # Release eager pins from an incomplete group.
+                    if pinned_this_key:
+                        self.storage_manager.batched_unpin(pinned_this_key)
                     logger.debug(f"total_hit_tokens to {total_hit_tokens}, res is {res}")
                     return res
             else:

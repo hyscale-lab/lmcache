@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import TYPE_CHECKING, Tuple, Union
+import hashlib
 import os
 import threading
 
@@ -76,11 +77,16 @@ def lmcache_get_or_create_config() -> Union[Config, V1Config]:
     return _config_instance
 
 
-def hex_hash_to_int16(s: str) -> int:
-    """
-    Convert a hex hash string to a 16-bit integer.
-    """
-    return int(s, 16) & 0xFFFF
+def hex_hash_to_token_sentinel(s: str) -> int:
+    """Convert a content hash to a signed-64-bit cache-only token ID."""
+    try:
+        raw_hash = bytes.fromhex(s)
+    except ValueError:
+        raw_hash = s.encode("utf-8")
+    folded = int.from_bytes(
+        hashlib.blake2b(raw_hash, digest_size=8).digest(), "big"
+    ) & 0x7FFFFFFFFFFFFFFF
+    return -1 - folded
 
 
 def apply_mm_hashes_to_token_ids(
@@ -96,11 +102,10 @@ def apply_mm_hashes_to_token_ids(
     logger.debug("Token IDs before applying multimodal hashes: %s", len(token_ids))
     for hash_str, placeholder in zip(mm_hashes, mm_positions, strict=False):
         start, length = placeholder.offset, placeholder.length
-        # logger.info("placeholder.offset: %d, placeholder.length: %d for hash %s", start, length, hash_str)
         if start >= n:
             continue
         end = min(start + length, n)
-        token_ids[start:end] = hex_hash_to_int16(hash_str)
+        token_ids[start:end] = hex_hash_to_token_sentinel(hash_str)
     logger.debug("Token IDs after applying multimodal hashes: %s", len(token_ids))
     return token_ids
 
@@ -245,7 +250,22 @@ def extract_image_grid_thw(request) -> list:
         grid = mm_input.get("image_grid_thw")
         if grid is not None:
             if hasattr(grid, "tolist"):
-                result.extend(grid.tolist())
-            elif isinstance(grid, (list, tuple)):
-                result.extend(grid)
+                grid = grid.tolist()
+            if not isinstance(grid, (list, tuple)):
+                continue
+
+            # Normalize nested or flat grids to [[t, h, w], ...].
+            if grid and not isinstance(grid[0], (list, tuple)):
+                if len(grid) % 3 != 0:
+                    logger.warning(
+                        "Ignoring malformed image_grid_thw with %d values; "
+                        "expected a multiple of 3.",
+                        len(grid),
+                    )
+                    continue
+                result.extend([list(grid[i : i + 3]) for i in range(0, len(grid), 3)])
+            else:
+                for entry in grid:
+                    if isinstance(entry, (list, tuple)) and len(entry) == 3:
+                        result.append(list(entry))
     return result

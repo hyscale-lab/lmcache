@@ -58,10 +58,7 @@ class LMCFlashAttnBackend(AttentionInterface):
 
         # TODO(Jiayi): Figure out how to use aot_schedule.
         scheduler_metadata = self._schedule(
-            # Tier-1: one request => batch=1. Tier-2 batched recompute packs N
-            # requests; the segment count is cu_seqlens_q-1 (only consumed when
-            # aot_schedule is on; the varlen call below honors cu_seqlens either way).
-            batch_size=int(cu_seqlens_q.shape[0] - 1),
+            batch_size=1,
             cu_query_lens=cu_seqlens_q,
             max_query_len=max_seqlen_q,
             seqlens=seqused_k,

@@ -113,6 +113,15 @@ def test_update_config_from_env_error_handling():
     del os.environ["LMCACHE_CONTROLLER_PULL_URL"]
 
 
+def test_local_gpu_rejects_incompatible_storage_backends():
+    config = LMCacheEngineConfig.from_defaults()
+    config.local_gpu = True
+    config.remote_url = "file:///tmp/remote-cache"
+
+    with pytest.raises(ValueError, match="local_gpu=True is an exclusive"):
+        config.validate()
+
+
 @pytest.mark.parametrize("use_mla", [True, False])
 def test_get_lookup_server_worker_ids(use_mla):
     config = LMCacheEngineConfig.from_defaults()

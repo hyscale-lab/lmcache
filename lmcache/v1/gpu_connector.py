@@ -2,7 +2,6 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
-import logging
 import os
 
 # Third Party
@@ -23,6 +22,19 @@ if torch.cuda.is_available():
 logger = init_logger(__name__)
 
 
+def _context_hashes_match(memory_objs, expected_hashes) -> bool:
+    if expected_hashes is None or len(memory_objs) != len(expected_hashes):
+        return False
+    return all(
+        memory_obj is not None
+        and memory_obj.metadata.cached_context_hash is not None
+        and memory_obj.metadata.cached_context_hash == expected_hash
+        for memory_obj, expected_hash in zip(
+            memory_objs, expected_hashes, strict=True,
+        )
+    )
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotary embedding helper: [-x2, x1, -x4, x3, ...]"""
     x1 = x[..., : x.shape[-1] // 2]
@@ -36,35 +48,51 @@ def _mrope_delta_rotate_k(
     new_positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     head_size: int,
+    mrope_section: Optional[List[int]] = None,
+    mrope_interleaved: bool = False,
 ) -> torch.Tensor:
-    """Apply DELTA rotation to cached K for mRoPE models.
-
-    Unlike the fused kernel (which un-rotates from old_pos then re-rotates to
-    new_pos), this function directly applies rotation by (new_pos - old_pos).
-    For mRoPE, the fused un-rotate/re-rotate approach fails because the
-    per-token 1D position doesn't match the per-section mRoPE positions used
-    during original encoding.  However, the per-axis mRoPE base offsets shift
-    uniformly, so a direct delta rotation is correct.
-
-    k: (num_tokens, num_kv_heads * head_size)
-    old_positions, new_positions: (num_tokens,) -- 1D sequential positions
-    cos_sin_cache: (max_position, rotary_dim) from model's RotaryEmbedding
-    head_size: per-head dimension
-    """
+    """Rotate cached K by the 1D or three-axis mRoPE position delta."""
     num_tokens = k.shape[0]
     num_kv_heads = k.shape[1] // head_size
     rotary_dim = cos_sin_cache.shape[-1]
     rot_dim_half = rotary_dim // 2
 
-    delta = new_positions - old_positions  # (T,)
+    delta = new_positions - old_positions
     abs_delta = delta.abs().clamp(max=cos_sin_cache.shape[0] - 1)
 
-    cs = cos_sin_cache[abs_delta]  # (T, rotary_dim)
-    cos_d = cs[:, :rot_dim_half]
-    sin_d = cs[:, rot_dim_half:]
+    cs = cos_sin_cache[abs_delta]
+    cos_axes = cs[..., :rot_dim_half]
+    sin_axes = cs[..., rot_dim_half:]
 
     neg_mask = (delta < 0).unsqueeze(-1)
-    sin_d = torch.where(neg_mask, -sin_d, sin_d)
+    sin_axes = torch.where(neg_mask, -sin_axes, sin_axes)
+
+    if delta.ndim == 2:
+        if delta.shape[0] != 3 or not mrope_section:
+            raise ValueError(
+                "3D mRoPE positions require three axes and mrope_section"
+            )
+        if mrope_interleaved:
+            cos_d = cos_axes[0].clone()
+            sin_d = sin_axes[0].clone()
+            h_end = mrope_section[1] * 3
+            w_end = mrope_section[2] * 3
+            cos_d[..., 1:h_end:3] = cos_axes[1, ..., 1:h_end:3]
+            cos_d[..., 2:w_end:3] = cos_axes[2, ..., 2:w_end:3]
+            sin_d[..., 1:h_end:3] = sin_axes[1, ..., 1:h_end:3]
+            sin_d[..., 2:w_end:3] = sin_axes[2, ..., 2:w_end:3]
+        else:
+            cos_parts = cos_axes.split(mrope_section, dim=-1)
+            sin_parts = sin_axes.split(mrope_section, dim=-1)
+            cos_d = torch.cat(
+                [part[axis] for axis, part in enumerate(cos_parts)], dim=-1,
+            )
+            sin_d = torch.cat(
+                [part[axis] for axis, part in enumerate(sin_parts)], dim=-1,
+            )
+    else:
+        cos_d = cos_axes
+        sin_d = sin_axes
 
     cos_full = torch.cat([cos_d, cos_d], dim=-1)  # (T, rotary_dim)
     sin_full = torch.cat([sin_d, sin_d], dim=-1)
@@ -374,9 +402,11 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record(self.load_stream)
+        profile = os.environ.get("LMCACHE_PROFILE_RETRIEVAL", "0") == "1"
+        if profile:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(self.load_stream)
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 if memory_obj is None:
@@ -385,10 +415,11 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                     )
                     continue
                 self.to_gpu(memory_obj, start, end, **kwargs)
-        end_event.record(self.load_stream)
-        end_event.synchronize()
-        elapsed_ms = start_event.elapsed_time(end_event)
-        logger.debug("batched_to_gpu cost %.3f ms", elapsed_ms)
+        if profile:
+            end_event.record(self.load_stream)
+            end_event.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
+            logger.info("batched_to_gpu cost %.3f ms", elapsed_ms)
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
@@ -418,6 +449,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.cache_positions = True
 
         self.fused_rotary_emb = None
+        self._position_repair_initialized = False
 
         assert use_gpu, "use_gpu must be true in VLLMBufferLayerwiseGPUConnector"
         assert "dtype" in kwargs, "dtype should be provided to create a GPU buffer."
@@ -442,6 +474,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         # track gap positions between blended chunks
         self.current_gap_positions = None
+        self.current_positions_unchanged = False
+        self.current_exact_prefix_match = False
 
         self.use_gpu = use_gpu
         self.gpu_buffer_allocator = None
@@ -449,6 +483,24 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
     def get_page_stream(self):
         return self.to_page_mem_stream
+
+    def _ensure_position_repair_initialized(self):
+        if self._position_repair_initialized:
+            return
+        self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
+        self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
+        self._is_mrope = getattr(self.lmc_model, "is_mrope", False)
+        if self._is_mrope:
+            logger.info(
+                "mRoPE model detected: using three-axis delta rotation"
+            )
+        elif self.fused_rotary_emb is not None:
+            self.lmc_model.rope_cache_to_device(self.device)
+        else:
+            raise RuntimeError(
+                "position repair requires a rotary embedding implementation"
+            )
+        self._position_repair_initialized = True
     
     def _lazy_initialize_buffer(self, kv_caches):
         """
@@ -526,10 +578,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         :param ends: The ending indices of the KV cache in the corresponding
             token sequence.
         """
-        # Per-layer timing requires two extra full stream syncs per layer
-        # (load_stream + current stream) just to read elapsed_time for a
-        # debug log. Only pay that when DEBUG logging is actually enabled.
-        timing = logger.isEnabledFor(logging.DEBUG)
+        # Profiling changes stream synchronization, so keep it opt-in.
+        timing = os.environ.get("LMCACHE_PROFILE_RETRIEVAL", "0") == "1"
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -538,17 +588,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        if self.fused_rotary_emb is None and self.cache_positions:
-            # TODO(Jiayi): Make this more elegant
-            self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
-            self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
-            self._is_mrope = getattr(self.lmc_model, "is_mrope", False)
-            if self._is_mrope:
-                logger.info("mRoPE model detected: will use mRoPE-aware delta rotation instead of 1D fused kernel.")
-            elif self.fused_rotary_emb is not None:
-                self.lmc_model.rope_cache_to_device(self.device)
-
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        expected_context_hashes = kwargs.get("cache_context_hashes")
+        self.current_positions_unchanged = False
+        self.current_exact_prefix_match = False
 
         self._lazy_initialize_buffer(self.kvcaches)
 
@@ -568,9 +611,16 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         buf_offset = starts[0]
         if self.cache_positions:
-            new_positions_full = torch.arange(
-                starts[0], ends[-1], dtype=torch.int64, device=self.kvcaches[0].device
-            )
+            requested_positions = kwargs.get("cache_positions")
+            if requested_positions is not None:
+                new_positions_full = requested_positions[..., starts[0]:ends[-1]].to(
+                    device=self.kvcaches[0].device, dtype=torch.int64,
+                )
+            else:
+                new_positions_full = torch.arange(
+                    starts[0], ends[-1], dtype=torch.int64,
+                    device=self.kvcaches[0].device,
+                )
 
         buffer_shape = self.get_shape(num_all_tokens)
         assert self.gpu_buffer_allocator is not None
@@ -592,9 +642,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         stream = torch.cuda.current_stream()
 
         if self.cache_positions:
-            old_positions_full = torch.zeros(
-                (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
-            )
+            old_positions_full = torch.zeros_like(new_positions_full)
         for layer_id in range(self.num_layers + 2):
             store_events = None
             rope_events = None
@@ -620,18 +668,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
 
             if layer_id > 0 and layer_id <= self.num_layers:
-                # NOTE: wait until both compute and load streams are done.
-                # Default: global barrier (batch-path safe). Async-overlap
-                # prototype (#async): a global sync here would barrier the
-                # whole device and defeat blend<->prefill overlap, so use
-                # scoped cross-stream waits instead (the load_stream feeds
-                # rope on `stream`; both directions covered for the 2-buffer
-                # ping-pong). Validate output byte-identical when enabling.
-                if os.environ.get("VLLM_CODECSIGHT_ASYNC_OVERLAP", "0") == "1":
-                    stream.wait_stream(self.load_stream)
-                    self.load_stream.wait_stream(stream)
-                else:
-                    torch.cuda.synchronize()
+                torch.cuda.synchronize()
 
                 # ping-pong the buffers
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
@@ -643,8 +680,9 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     rope_start = torch.cuda.Event(enable_timing=True)
                     rope_end = torch.cuda.Event(enable_timing=True)
                     rope_start.record(stream)
-                if self.cache_positions:
+                if self.cache_positions and not self.current_positions_unchanged:
                     assert compute_gpu_buffer_obj.tensor is not None
+                    self._ensure_position_repair_initialized()
 
                     if getattr(self, "_is_mrope", False):
                         rotary_emb = self.lmc_model.layers[0].self_attn.rotary_emb
@@ -654,6 +692,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                             new_positions_full,
                             rotary_emb.cos_sin_cache,
                             rotary_emb.head_size,
+                            rotary_emb.mrope_section,
+                            rotary_emb.mrope_interleaved,
                         )
                     else:
                         compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
@@ -679,6 +719,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 # memobj -> gpu_buffer
                 c = 0
                 evicted_ranges = []
+                context_hashes_match = (
+                    layer_id == 0
+                    and _context_hashes_match(
+                        memory_objs_layer, expected_context_hashes,
+                    )
+                )
                 with torch.cuda.stream(self.load_stream):
                     if timing:
                         load_start = torch.cuda.Event(enable_timing=True)
@@ -692,6 +738,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         e = end - buf_offset
                         if memory_obj is None:
                             evicted_ranges.append((s, e))
+                            context_hashes_match = False
                             continue
                         assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
                         assert load_gpu_buffer_obj.tensor is not None
@@ -699,7 +746,13 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         load_gpu_buffer_obj.tensor[:, s:e].copy_(memory_obj.tensor, non_blocking=True)
 
                         if self.cache_positions and layer_id == 0:
-                            old_positions_full[s:e] = memory_obj.metadata.cached_positions
+                            cached_positions = memory_obj.metadata.cached_positions
+                            if cached_positions is None:
+                                raise RuntimeError(
+                                    "Cached KV is missing position metadata; "
+                                    "refusing unsafe RoPE reuse."
+                                )
+                            old_positions_full[..., s:e] = cached_positions
                     if timing:
                         load_end.record(self.load_stream)
                         load_events = (load_start, load_end)
@@ -717,6 +770,25 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         "batched_to_gpu: %d evicted chunk(s) on layer %d; "
                         "added %d positions to gap mask",
                         len(evicted_ranges), layer_id, extra_gaps.numel(),
+                    )
+                if layer_id == 0:
+                    no_gaps = self.current_gap_positions.numel() == 0
+                    self.current_positions_unchanged = (
+                        no_gaps
+                        and torch.equal(old_positions_full, new_positions_full)
+                    )
+                    self.current_exact_prefix_match = (
+                        starts[0] == 0
+                        and self.current_positions_unchanged
+                        and context_hashes_match
+                    )
+                    logger.debug(
+                        "LMCache reuse classification: exact_prefix=%s, "
+                        "positions_unchanged=%s, context_match=%s, gaps=%d",
+                        self.current_exact_prefix_match,
+                        self.current_positions_unchanged,
+                        context_hashes_match,
+                        int(self.current_gap_positions.numel()),
                     )
 
             elif layer_id == self.num_layers:
@@ -822,17 +894,33 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         slot_mapping_chunks = []
         buf_starts_ends = []
         old_positions_chunks = []
+        context_hashes = kwargs.get("cache_context_hashes")
+        if context_hashes is None:
+            context_hashes = [None] * len(starts)
+        elif len(context_hashes) != len(starts):
+            raise ValueError(
+                "cache_context_hashes must align with stored cache chunks"
+            )
         for start, end in zip(starts, ends, strict=False):
             buf_end = buf_start + end - start
             buf_starts_ends.append((buf_start, buf_end))
             slot_mapping_chunks.append(slot_mapping[start:end])
             buf_start = buf_end
             if self.cache_positions:
-                old_positions_chunks.append(
-                    torch.arange(
-                        start, end, device=self.kvcaches[0].device, dtype=torch.int64
+                requested_positions = kwargs.get("cache_positions")
+                if requested_positions is not None:
+                    old_positions_chunks.append(
+                        requested_positions[..., start:end].to(
+                            device=self.kvcaches[0].device, dtype=torch.int64,
+                        )
                     )
-                )
+                else:
+                    old_positions_chunks.append(
+                        torch.arange(
+                            start, end, device=self.kvcaches[0].device,
+                            dtype=torch.int64,
+                        )
+                    )
 
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
@@ -862,10 +950,16 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     False,  # shape is [2, num_tokens, hidden_dim]
                     self.vllm_two_major,
                 )
-                for (buf_start, buf_end), memory_obj, old_positions in zip(
+                for (
+                    (buf_start, buf_end),
+                    memory_obj,
+                    old_positions,
+                    context_hash,
+                ) in zip(
                     buf_starts_ends,
                     memory_objs_layer,
                     old_positions_chunks,
+                    context_hashes,
                     strict=False,
                 ):
                     assert memory_obj.tensor is not None
@@ -879,6 +973,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     )
                     if self.cache_positions:
                         memory_obj.metadata.cached_positions = old_positions
+                    memory_obj.metadata.cached_context_hash = context_hash
 
             yield
             self.store_stream.synchronize()
@@ -1034,6 +1129,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
+        timing = os.environ.get("LMCACHE_PROFILE_RETRIEVAL", "0") == "1"
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
@@ -1041,8 +1137,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 current_stream.wait_stream(self.load_stream)
             if layer_id > 0:
                 logger.debug(f"Finished loading layer {layer_id - 1}")
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+            if timing:
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
             # memobj -> gpu_buffer -> kvcaches
             with torch.cuda.stream(self.load_stream):
                 for start, end, memory_obj in zip(
@@ -1055,7 +1152,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         )
                         continue
                     assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
-                    start_event.record(self.load_stream)
+                    if timing:
+                        start_event.record(self.load_stream)
                     if self.use_gpu:
                         tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
                             memory_obj.tensor, non_blocking=True
@@ -1069,17 +1167,20 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             True,
                             self.vllm_two_major,
                         )
-                    end_event.record(self.load_stream)
-                    end_event.synchronize()
-                    elapsed_ms = start_event.elapsed_time(end_event)
-                    logger.debug(
-                        "Layer %d, chunk (%d, %d) transfer to GPU buffer cost %.3f ms",
-                        layer_id,
-                        start,
-                        end,
-                        elapsed_ms,
-                    )
-                start_event.record(self.load_stream)
+                    if timing:
+                        end_event.record(self.load_stream)
+                        end_event.synchronize()
+                        elapsed_ms = start_event.elapsed_time(end_event)
+                        logger.info(
+                            "Layer %d, chunk (%d, %d) transfer to GPU "
+                            "buffer cost %.3f ms",
+                            layer_id,
+                            start,
+                            end,
+                            elapsed_ms,
+                        )
+                if timing:
+                    start_event.record(self.load_stream)
                 if self.use_gpu:
                     lmc_ops.single_layer_kv_transfer(
                         tmp_gpu_buffer_obj.tensor,
@@ -1089,14 +1190,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         True,
                         self.vllm_two_major,
                     )
-                end_event.record(self.load_stream)
-                end_event.synchronize()
-                elapsed_ms = start_event.elapsed_time(end_event)
-                logger.debug(
-                    "Layer %d transfer from GPU buffer to paged memory cost %.3f ms",
-                    layer_id,
-                    elapsed_ms,
-                )
+                if timing:
+                    end_event.record(self.load_stream)
+                    end_event.synchronize()
+                    elapsed_ms = start_event.elapsed_time(end_event)
+                    logger.info(
+                        "Layer %d transfer from GPU buffer to paged memory "
+                        "cost %.3f ms",
+                        layer_id,
+                        elapsed_ms,
+                    )
         yield
         # synchronize the last layer
         if sync:

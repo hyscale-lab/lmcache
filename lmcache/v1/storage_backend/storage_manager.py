@@ -39,7 +39,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.v1.storage_backend.gpu_backend import LocalGPUBackend
+from lmcache.v1.storage_backend.local_gpu_backend import LocalGPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 
 if TYPE_CHECKING:
@@ -216,10 +216,6 @@ class StorageManager:
             f"Storage backends created: "
             f"{', '.join(self.storage_backends.keys())}"
         )
-        logger.info(
-            f"Storage backends created: "
-            f"{', '.join(self.storage_backends.keys())}"
-        )
 
         # the backend used for actual storage
         self.non_allocator_backends = self.get_non_allocator_backends()
@@ -231,8 +227,6 @@ class StorageManager:
             self.allocator_backend = self._get_allocator_backend(config)
         if config.local_cpu:
             self.local_cpu_backend = self.storage_backends["LocalCPUBackend"]
-        if config.local_gpu:
-            self.local_gpu_backend = self.storage_backends["LocalGPUBackend"]
         if config.local_gpu:
             self.local_gpu_backend = self.storage_backends["LocalGPUBackend"]
 
@@ -313,8 +307,6 @@ class StorageManager:
     ) -> AllocatorBackendInterface:
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
-        elif self.config.local_gpu:
-            allocator_backend = self.storage_backends["LocalGPUBackend"]
         elif self.config.local_gpu:
             allocator_backend = self.storage_backends["LocalGPUBackend"]
         else:
@@ -558,13 +550,7 @@ class StorageManager:
         """
         Blocking function to get the memory object from the storages.
         """
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
         # Search all backends for blocking get
-        start_event.record()
-        start_event.record()
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
@@ -587,10 +573,6 @@ class StorageManager:
                     local_gpu_backend = self.storage_backends["LocalGPUBackend"]
                     assert isinstance(local_gpu_backend, LocalGPUBackend)
                     local_gpu_backend.submit_put_task(key, memory_obj)
-                end_event.record()
-                torch.cuda.synchronize()
-                elapsed_time_ms = start_event.elapsed_time(end_event)
-                logger.info(f"Elapsed time for load data: {elapsed_time_ms:.3f} ms")
                 return memory_obj
         
         return None
@@ -651,7 +633,8 @@ class StorageManager:
         :return: A generator that yields a future for each layer.
         """
         if location is None:
-            location = "LocalGPUBackend"
+            assert self.allocator_backend is not None
+            location = str(self.allocator_backend)
         for keys_multi_chunk in keys:
             # Retrieve all chunks for one layer
             backend = self.storage_backends[location]
@@ -671,25 +654,24 @@ class StorageManager:
         self,
         keys: List[List[CacheEngineKey]],
         location: Optional[str] = None,
-    ) -> Generator[Future, None, None]:
+    ) -> Generator[List[Optional[MemoryObj]], None, None]:
         """
-        Non-blocking function to get the memory objects into the storages
-        in a layerwise manner.
-        Do not store if the same object is being stored (handled here by
-        storage manager) or has been stored (handled by storage backend).
+        Blocking layerwise retrieval from one explicitly selected backend.
+
         :param List[List[CacheEngineKey]] keys: The keys to get. The first
             dimension corresponds to the number of layers, and the second
             dimension corresponds to the number of chunks.
-        :return: A generator that yields a future for each layer.
+        :return: A generator that yields the memory objects for each layer.
         """
         if location is None:
-            location = "LocalGPUBackend"
+            assert self.allocator_backend is not None
+            location = str(self.allocator_backend)
             
         for keys_multi_chunk in keys:
             # Retrieve all chunks for one layer
             backend = self.storage_backends[location]
-            task = backend.batched_get_blocking(keys_multi_chunk)
-            yield task            
+            memory_objs = backend.batched_get_blocking(keys_multi_chunk)
+            yield memory_objs
 
     def prefetch_single_done_callback(
         self,
@@ -849,7 +831,6 @@ class StorageManager:
 
         return: True if the key exists in the specified storage backends.
         """
-        # logger.info(f"Checking contains for key {key} with pin={pin}")
         for backend_name, backend in self.storage_backends.items():
             if search_range and backend_name not in search_range:
                 continue
@@ -859,10 +840,30 @@ class StorageManager:
                 pin = False
 
             if backend.contains(key, pin):
-                # logger.info(f"Key {key} found in backend {backend_name}, pin={pin}")
                 return backend_name
 
         return None
+
+    def batched_get_locations(
+        self,
+        keys: Sequence[CacheEngineKey],
+        search_range: Optional[List[str]] = None,
+    ) -> List[Optional[str]]:
+        """Return each key's first matching backend, preserving misses."""
+        locations: List[Optional[str]] = [None] * len(keys)
+        for backend_name, backend in self.storage_backends.items():
+            if search_range and backend_name not in search_range:
+                continue
+            if backend.support_batched_contains():
+                hits = backend.batched_contains(
+                    list(keys), pin=False, stop_after_first_not_exits=False
+                )
+            else:
+                hits = [backend.contains(key, pin=False) for key in keys]
+            for idx, hit in enumerate(hits):
+                if hit and locations[idx] is None:
+                    locations[idx] = backend_name
+        return locations
 
     def batched_contains(
         self,

@@ -65,6 +65,8 @@ def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
     elif model_name in {
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen2VLForConditionalGeneration",
+        # LLaVA-OneVision uses a Qwen2 decoder.
+        "LlavaOnevisionForConditionalGeneration",
     }:
         # First Party
         from lmcache.v1.compute.models.qwen2vl import LMCQwen2VLModel

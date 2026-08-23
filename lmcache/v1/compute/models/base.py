@@ -2,6 +2,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple
+import os
 
 # Third Party
 from torch import nn
@@ -9,7 +10,7 @@ import torch
 
 # First Party
 from lmcache.v1.compute.attention.utils import infer_attn_backend_from_vllm
-from lmcache.v1.compute.positional_encoding import get_fused_rope
+from lmcache.v1.compute.positional_encoding import get_fused_rope_from_vllm
 
 # TODO(Jiayi): A few things need to be tested/supported:
 # TP, PP, Multimodal
@@ -102,14 +103,6 @@ class LMCBaseModel(nn.Module, ABC):
         # --- Rotary Embedding (field name compatibility) ---
         # Take rotary_emb from the 0th layer
         rotary = self.layers[0].self_attn.rotary_emb
-        head_dim = _pick(rotary, "head_size", "head_dim")
-        max_position_embeddings = _pick(rotary, "max_position_embeddings", "max_seq_len_cached", default=8192)
-        # Qwen common base field may also be called rope_theta
-        base = _pick(rotary, "base", "rope_theta", default=10000.0)
-        is_neox_style = getattr(rotary, "is_neox_style", True)
-        dtype = getattr(rotary, "dtype", torch.get_default_dtype())
-        rope_scaling = getattr(rotary, "rope_scaling", None)
-
         self.is_mrope = hasattr(rotary, "mrope_section") and rotary.mrope_section is not None
         self.mrope_section = getattr(rotary, "mrope_section", None)
 
@@ -121,19 +114,14 @@ class LMCBaseModel(nn.Module, ABC):
             )
             self.fused_rotary_emb = None
         else:
-            self.fused_rotary_emb = get_fused_rope(
-                head_dim,
-                rotary_dim=head_dim,
-                max_position=max_position_embeddings,
-                base=base,
-                rope_scaling=rope_scaling,
-                is_neox_style=is_neox_style,
-                dtype=dtype,
-            )
+            self.fused_rotary_emb = get_fused_rope_from_vllm(rotary)
 
         # NOTE(Jiayi): better not to pass the blender in init
         # if we want to make this LMCModel more general.
         self.blender = blender
+        self.profile_layer_timing = (
+            os.environ.get("LMCACHE_PROFILE_BLEND_LAYERS", "0") == "1"
+        )
 
     @abstractmethod
     def _process_qkv(self, q, k, v, layer):
@@ -194,7 +182,7 @@ class LMCBaseModel(nn.Module, ABC):
         deepstack_input_embeds: "Optional[torch.Tensor]" = None,
         **kwargs,
     ):
-        timing = True
+        timing = self.profile_layer_timing
         input_ids = input_ids.cuda()
 
         if inputs_embeds is not None:
@@ -220,11 +208,11 @@ class LMCBaseModel(nn.Module, ABC):
             total_events = None
             # Pre-LN/residual before Self Attention
             with torch.cuda.stream(stream):
-                if timing is not None:
+                if timing:
                     total_start = torch.cuda.Event(enable_timing=True)
                     total_end = torch.cuda.Event(enable_timing=True)
                     total_start.record(stream)
-                if timing is not None:
+                if timing:
                     pre_attn_start = torch.cuda.Event(enable_timing=True)
                     pre_attn_end = torch.cuda.Event(enable_timing=True)
                     pre_attn_start.record(stream)
@@ -244,11 +232,10 @@ class LMCBaseModel(nn.Module, ABC):
                 q, k, v, residual, attn_output, attn_metadata = self.blender.process_qkv(
                     q, k, v, residual, self.start_layer + layer_idx, attn_output, attn_metadata
                 )
-                if timing is not None:
+                if timing:
                     pre_attn_end.record(stream)
                     pre_attn_events = (pre_attn_start, pre_attn_end)
 
-                # Take attention dimensions for this layer (extracted from vllm_attn_layers, stored in __init__)
                 attn_core = self.vllm_attn_layers[self.start_layer + layer_idx]
                 num_heads = _pick(attn_core, "num_heads")
                 num_kv_heads = _pick(attn_core, "num_kv_heads", "num_key_value_heads")
@@ -262,29 +249,21 @@ class LMCBaseModel(nn.Module, ABC):
                     -1, num_heads, head_size
                 )
 
-                if timing is not None:
+                if timing:
                     attn_start = torch.cuda.Event(enable_timing=True)
                     attn_end = torch.cuda.Event(enable_timing=True)
                     attn_start.record(stream)
-                attn_output = self.lmc_attn_layers[self.start_layer + layer_idx].forward_contiguous(
-                    q, k, v, attn_output, attn_metadata
+                attn_output = self.blender.forward_attention(
+                    self.lmc_attn_layers[self.start_layer + layer_idx],
+                    q, k, v, attn_output, attn_metadata,
                 )
-                if timing is not None:
+                if timing:
                     attn_end.record(stream)
                     attn_events = (attn_start, attn_end)
 
                 attn_output = attn_output.view(-1, num_heads * head_size)
-                # K/V reshape back to flat for downstream (even if not directly used, keep consistent with original implementation)
-                _ = k.view(-1, num_kv_heads * head_size)
-                _ = v.view(-1, num_kv_heads * head_size)
-
-                # # if layer_idx > check_layer, skip the following operations
-                # if layer_idx > check_layers[-1]: 
-                #     yield
-                #     continue 
-
                 # Output projection
-                if timing is not None:
+                if timing:
                     post_attn_start = torch.cuda.Event(enable_timing=True)
                     post_attn_end = torch.cuda.Event(enable_timing=True)
                     post_attn_start.record(stream)
@@ -292,11 +271,11 @@ class LMCBaseModel(nn.Module, ABC):
 
                 # FFN
                 hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
-                if timing is not None:
+                if timing:
                     post_attn_end.record(stream)
                     post_attn_events = (post_attn_start, post_attn_end)
 
-                if timing is not None:
+                if timing:
                     ffn_start = torch.cuda.Event(enable_timing=True)
                     ffn_end = torch.cuda.Event(enable_timing=True)
                     ffn_start.record(stream)
@@ -320,13 +299,13 @@ class LMCBaseModel(nn.Module, ABC):
                                 ds_slice = ds_slice.index_select(0, imp_indices)
                             if ds_slice.shape[0] == residual.shape[0]:
                                 residual = residual + ds_slice
-                if timing is not None:
+                if timing:
                     ffn_end.record(stream)
                     ffn_events = (ffn_start, ffn_end)
                     total_end.record(stream)
                     total_events = (total_start, total_end)
 
-            if timing is not None:
+            if timing:
                 # Synchronize once per layer so all CUDA events are complete.
                 stream.synchronize()
                 layer_no = self.start_layer + layer_idx
@@ -344,86 +323,5 @@ class LMCBaseModel(nn.Module, ABC):
                     ffn_ms,
                     total_ms,
                 )
-
-            yield
-
-    # ------------------------------------------------------------------
-    # Tier-2: batched selective recompute (LMCACHE_BATCHED_BLEND=1)
-    # ------------------------------------------------------------------
-    def compute_layer_batched(
-        self,
-        packed_embeds: torch.Tensor,
-        req_meta: list,
-        kvcaches,
-    ):
-        """Packed selective-recompute forward for N requests in ONE pass.
-
-        See codecsight-bench/TIER2_BATCHED_BLEND.md. The token-wise ops (LN, QKV,
-        o_proj, FFN) run on the concatenated [ΣA, hidden] anchor tensor; attention
-        is a single varlen call whose cu_seqlens isolate each request (validated
-        bitwise-equal to N serial calls in tests/tier2_batched_attn_parity.py).
-
-        req_meta: list of per-request dicts, each with:
-          - 'positions':    anchor RoPE positions, [A] (1D) or [3, A] (mRoPE)
-          - 'slot_full':     paged-cache flat slots for all S cached tokens, [S]
-          - 'anchor_local':  anchor indices within 0..S, [A]
-        Phase-1 must have already loaded + RoPE-corrected each request's full
-        cached KV into the paged cache (the non-anchor context attended here).
-
-        Generator: yields once per layer (mirrors compute_layer's cadence so the
-        caller can step Phase-1 retrievers in lockstep if pipelining the load).
-        """
-        hidden_states = packed_embeds.cuda()
-        residual = None
-        A_list = [int(m["positions"].shape[-1]) for m in req_meta]
-        cu_q = torch.tensor(
-            [0] + list(torch.tensor(A_list).cumsum(0)),
-            dtype=torch.int32, device=hidden_states.device,
-        )
-
-        for layer_idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
-            global_layer = self.start_layer + layer_idx
-
-            if residual is None:
-                residual = hidden_states
-                hidden_states = layer.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = layer.input_layernorm(hidden_states, residual)
-
-            q, k, v = self._project_qkv(layer, hidden_states)
-            q, k, v = self._process_qkv(q, k, v, layer)
-
-            # Blender owns RoPE + per-request KV gather/scatter/concat.
-            q, old_k, old_v, attn_metadata = self.blender.process_qkv_batched(
-                q, k, v, global_layer, req_meta, kvcaches, cu_q,
-            )
-
-            attn_core = self.vllm_attn_layers[global_layer]
-            num_heads = _pick(attn_core, "num_heads")
-            num_kv_heads = _pick(attn_core, "num_kv_heads", "num_key_value_heads")
-            head_size = _pick(attn_core, "head_size", "head_dim")
-
-            q = q.view(-1, num_heads, head_size)
-            old_k = old_k.view(-1, num_kv_heads, head_size)
-            old_v = old_v.view(-1, num_kv_heads, head_size)
-            attn_output = torch.zeros_like(q)
-
-            attn_output = self.lmc_attn_layers[global_layer].forward_contiguous(
-                q, old_k, old_v, attn_output, attn_metadata
-            )
-            attn_output = attn_output.view(-1, num_heads * head_size)
-
-            hidden_states, _ = layer.self_attn.o_proj(attn_output)
-            hidden_states, residual = layer.post_attention_layernorm(
-                hidden_states, residual
-            )
-
-            skip_ffn = bool(getattr(self.blender, "skip_ffn", False))
-            if skip_ffn and bool(getattr(self.blender, "skip_ffn_only_codecsight", True)):
-                skip_ffn = getattr(self.blender, "blend_mode", "") in ("codecsight",)
-            if skip_ffn:
-                hidden_states = torch.zeros_like(hidden_states)
-            else:
-                hidden_states = layer.mlp(hidden_states)
 
             yield

@@ -81,54 +81,68 @@ def test_segment_token_database(prefix_length, chunk_lengths):
     sys_tokens = generate_tokens(sys_length, "cpu", fixed=True)
     query_tokens = generate_tokens(query_length, "cpu", fixed=True)
 
-    token_chunks = []
-    starts = [0]
-    ends = [sys_length]
-    sys_tuple = tuple(sys_tokens.cpu().tolist())
-    sys_hash = hash((None, sys_tuple, None))
-    hashes = [sys_hash]
-    start = sys_length + len(sep_tokens)
-    for idx, chunk_length in enumerate(chunk_lengths):
+    frame_tokens = []
+    for chunk_length in chunk_lengths:
         token_chunk = generate_tokens(chunk_length, "cpu", fixed=True)
+        frame_tokens.append(token_chunk)
 
-        token_tuple = tuple(token_chunk.cpu().tolist())
-        token_hash = hash((None, token_tuple, None))
-        hashes.append(token_hash)
-
-        token_chunk = torch.cat([sep_tokens, token_chunk])
-        token_chunks.append(token_chunk)
-        starts.append(start)
-        ends.append(start + chunk_length)
-        start += chunk_length + len(sep_tokens)
-
-    query_tuple = tuple(query_tokens.cpu().tolist())
-    query_hash = hash((None, query_tuple, None))
-    hashes.append(query_hash)
-    starts.append(start)
-    ends.append(start + query_length)
-
-    tokens = torch.cat([sys_tokens, *token_chunks, sep_tokens, query_tokens])
+    # Separator-inclusive chunks must tile the reported cache-hit prefix.
+    chunks = [
+        torch.cat([sys_tokens, sep_tokens]),
+        *(torch.cat([chunk, sep_tokens]) for chunk in frame_tokens),
+        query_tokens,
+    ]
+    tokens = torch.cat(chunks)
     total_length = len(tokens)
     mask = torch.full([total_length], True, dtype=torch.bool, device="cpu")
     mask[:prefix_length] = False
 
-    chunk_lists = [sys_tokens, *token_chunks, sep_tokens, query_tokens]
-    skip_chunk_num = 0
-    cum_length = 0
-    for chunk in chunk_lists:
-        if prefix_length > cum_length:
-            skip_chunk_num += 1
-        cum_length += len(chunk)
-
-    starts = starts[skip_chunk_num:]
-    ends = ends[skip_chunk_num:]
-    hashes = hashes[skip_chunk_num:]
+    expected = []
+    start = 0
+    for chunk in chunks:
+        end = start + len(chunk)
+        if start >= prefix_length:
+            expected.append((
+                start,
+                end,
+                hash((None, tuple(chunk.cpu().tolist()), None)),
+            ))
+        start = end
 
     original_results = list(db.process_tokens(tokens=tokens, mask=mask))
-    for i in range(len(original_results)):
-        st, ed, key = original_results[i]
-        assert st == starts[i]
-        assert ed == ends[i]
-        assert key.chunk_hash == hashes[i]
-        # print(st, starts[i])
-        # print(ed, ends[i])
+    assert len(original_results) == len(expected)
+    for (st, ed, key), (expected_st, expected_ed, expected_hash) in zip(
+        original_results, expected, strict=True,
+    ):
+        assert st == expected_st
+        assert ed == expected_ed
+        assert key.chunk_hash == expected_hash
+
+
+def test_segment_token_database_ranges_are_contiguous_without_tokenizer():
+    """Regression: separator holes must never be reported as cached prefix."""
+    db = SegmentTokenDatabase.__new__(SegmentTokenDatabase)
+    db.sep_tokens = torch.tensor([90, 91], dtype=torch.long)
+    db.sep_len = 2
+    db.hash_func = hash
+    db.metadata = None
+
+    tokens = torch.tensor([
+        1, 2, 90, 91,       # system + separator
+        10, 11, 90, 91,     # frame 0 + separator
+        20, 21, 90, 91,     # frame 1 + separator
+        30, 31,              # query (not stored)
+    ])
+
+    results = list(db.process_tokens(
+        tokens=tokens, make_key=False, skip_last_segment=True,
+    ))
+    assert [(start, end) for start, end, _ in results] == [
+        (0, 4), (4, 8), (8, 12),
+    ]
+    assert all(
+        left_end == right_start
+        for (_, left_end, _), (right_start, _, _) in zip(
+            results, results[1:], strict=False,
+        )
+    )

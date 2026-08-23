@@ -249,6 +249,7 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype: torch.dtype,
         fmt: MemoryFormat,
         cached_positions: Optional[torch.Tensor] = None,
+        cached_context_hash: Optional[bytes] = None,
     ) -> None:
         path = self._key_to_path(key)
 
@@ -260,7 +261,8 @@ class LocalDiskBackend(StorageBackendInterface):
                 has_stored = True
             else:
                 self.dict[key] = DiskCacheMetadata(
-                    path, size, shape, dtype, cached_positions, fmt, 0
+                    path, size, shape, dtype, cached_positions, fmt, 0,
+                    cached_context_hash,
                 )
 
         # push kv admit msg
@@ -466,9 +468,18 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
         cached_positions = memory_obj.metadata.cached_positions
+        cached_context_hash = memory_obj.metadata.cached_context_hash
         memory_obj.ref_count_down()
 
-        self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
+        self.insert_key(
+            key,
+            size,
+            shape,
+            dtype,
+            fmt,
+            cached_positions=cached_positions,
+            cached_context_hash=cached_context_hash,
+        )
 
         self.disk_worker.remove_put_task(key)
 
@@ -493,6 +504,9 @@ class LocalDiskBackend(StorageBackendInterface):
             # elegant way in the future.
             cached_positions = self.dict[key].cached_positions
             mem_obj.metadata.cached_positions = cached_positions
+            mem_obj.metadata.cached_context_hash = (
+                self.dict[key].cached_context_hash
+            )
 
             self.disk_lock.acquire()
             self.dict[key].unpin()
@@ -522,6 +536,9 @@ class LocalDiskBackend(StorageBackendInterface):
         # elegant way in the future.
         cached_positions = self.dict[key].cached_positions
         memory_obj.metadata.cached_positions = cached_positions
+        memory_obj.metadata.cached_context_hash = (
+            self.dict[key].cached_context_hash
+        )
 
         return memory_obj
 

@@ -110,6 +110,11 @@ class MemoryObjMetadata:
     # Positions when the cache is stored
     cached_positions: Optional[torch.Tensor] = None
 
+    # Digest of all cache-key tokens preceding and including this chunk.
+    # Segment caches use this to distinguish an exact prefix hit from a
+    # context-dependent segment hit.
+    cached_context_hash: Optional[bytes] = None
+
     def to_dict(self):
         # Note(Kuntai): this is used for serializing MemoryObjMetadata via
         # msgpack.
@@ -121,6 +126,7 @@ class MemoryObjMetadata:
             "phy_size": self.phy_size,
             "ref_count": self.ref_count,
             "fmt": self.fmt.value,
+            "cached_context_hash": self.cached_context_hash,
         }
 
     @staticmethod
@@ -134,6 +140,7 @@ class MemoryObjMetadata:
             phy_size=d["phy_size"],
             ref_count=d["ref_count"],
             fmt=MemoryFormat(d["fmt"]),
+            cached_context_hash=d.get("cached_context_hash"),
         )
 
     def get_size(self) -> int:
