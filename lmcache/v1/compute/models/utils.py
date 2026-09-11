@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Dict
+from typing import Any, Callable, Dict, Mapping
 
 # Third Party
 from torch import nn
@@ -12,12 +12,7 @@ logger = init_logger(__name__)
 
 
 def patch_vllm_dummy_video_inputs() -> bool:
-    """
-    vLLM <=0.11 builds dummy videos for MM profiling with numpy's default int64 dtype,
-    which Pillow rejects in `Image.fromarray` (see server_log.log error).
-    Patch vLLM's BaseDummyInputsBuilder to emit uint8 video tensors so InternVL
-    preprocessing succeeds during profiling.
-    """
+    """Make vLLM dummy video inputs compatible with image processors."""
     try:
         from vllm.multimodal import profiling as mm_profiling
     except Exception as exc:  # pragma: no cover - defensive guard
@@ -39,7 +34,6 @@ def patch_vllm_dummy_video_inputs() -> bool:
     def _get_dummy_videos(self, *, width, height, num_frames, num_videos):
         if num_videos == 0:
             return []
-        # Use uint8 and (frames, height, width, channels) so PIL can decode.
         video = np.full((num_frames, height, width, 3), 255, dtype=np.uint8)
         return [video] * num_videos
 
@@ -48,7 +42,7 @@ def patch_vllm_dummy_video_inputs() -> bool:
     logger.info("Patched vLLM dummy video generator to return uint8 arrays.")
     return True
 
-# Apply patch eagerly on import to avoid profiler crashes before model init.
+# Install before vLLM runs multimodal profiling.
 try:
     patch_vllm_dummy_video_inputs()
 except Exception as exc:  # pragma: no cover - defensive
@@ -97,6 +91,10 @@ def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
 class VLLMModelTracker:
     _vllm_models: Dict[str, nn.Module] = {}
     _encoder_caches: Dict[str, dict] = {}
+    _encoder_position_caches: Dict[str, dict] = {}
+    _encoder_recompute_callbacks: Dict[
+        str, Callable[..., Mapping[str, Any]]
+    ] = {}
 
     @classmethod
     def register_model(
@@ -127,6 +125,41 @@ class VLLMModelTracker:
     @classmethod
     def get_encoder_cache(cls, instance_id: str):
         return cls._encoder_caches.get(instance_id)
+
+    @classmethod
+    def register_encoder_position_cache(
+        cls,
+        instance_id: str,
+        encoder_position_cache: dict,
+    ):
+        cls._encoder_position_caches[instance_id] = encoder_position_cache
+        logger.info("Registered encoder position cache for %s", instance_id)
+
+    @classmethod
+    def get_encoder_position_cache(cls, instance_id: str):
+        return cls._encoder_position_caches.get(instance_id)
+
+    @classmethod
+    def register_encoder_recompute_callback(
+        cls,
+        instance_id: str,
+        callback: Callable[..., Mapping[str, Any]],
+    ) -> None:
+        """Register a worker callback for transient encoder re-computation.
+
+        The ordinary vLLM encoder cache is capacity bounded. Selective KV
+        refresh still needs visual embeddings for a cached LMCache prefix even
+        after those embeddings have been evicted. The callback re-encodes only
+        the missing visual items without pretending they were cache hits.
+        """
+        cls._encoder_recompute_callbacks[instance_id] = callback
+        logger.info(
+            "Registered encoder recompute callback for %s", instance_id
+        )
+
+    @classmethod
+    def get_encoder_recompute_callback(cls, instance_id: str):
+        return cls._encoder_recompute_callbacks.get(instance_id)
 
     @classmethod
     def get_model(

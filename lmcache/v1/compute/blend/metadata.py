@@ -37,6 +37,9 @@ class LMCBlendMetadata:
     image_grid_thw: Optional[List[List[int]]] = None
     input_ids: Optional[List[int]] = None
     causal_blocks: Optional[List[Tuple[int, int, int]]] = None
+    scattered_cache_seqlens: Optional[torch.Tensor] = None
+    scattered_cache_batch_idx: Optional[torch.Tensor] = None
+    selection_stats: Optional[dict[str, Any]] = None
 
     def clean(self):
         self.imp_indices = None
@@ -49,3 +52,6 @@ class LMCBlendMetadata:
         self.image_grid_thw = None
         self.input_ids = None
         self.causal_blocks = None
+        self.scattered_cache_seqlens = None
+        self.scattered_cache_batch_idx = None
+        self.selection_stats = None

@@ -351,7 +351,7 @@ class SegmentTokenDatabase(TokenDatabase):
             yield tokens[start:end]
             start = end
         # Yield trailing chunk only when skip_last is False
-        if not skip_last:
+        if not skip_last and start < len(tokens):
             yield tokens[start:]
 
     def process_tokens(
@@ -429,7 +429,7 @@ class SegmentTokenDatabase(TokenDatabase):
                     end_idx,
                     num_falses,
                 )
-                if start_idx >= num_falses:
+                if end_idx > num_falses:
                     if make_key:
                         logger.debug(
                             "making cache key: start=%d, end=%d, len=%d",

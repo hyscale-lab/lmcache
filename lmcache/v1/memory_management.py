@@ -115,6 +115,9 @@ class MemoryObjMetadata:
     # context-dependent segment hit.
     cached_context_hash: Optional[bytes] = None
 
+    # Local CUDA dependency; intentionally excluded from serialization.
+    ready_event: Optional[torch.cuda.Event] = None
+
     def to_dict(self):
         # Note(Kuntai): this is used for serializing MemoryObjMetadata via
         # msgpack.

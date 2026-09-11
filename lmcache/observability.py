@@ -194,6 +194,11 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_failed_count = 0
 
         self.local_cache_usage_bytes = 0
+        # Lifetime high-watermark.  The LocalGPU backend reserves one large
+        # tensor up front, while this counter tracks only bytes handed out to
+        # live cache objects.  Keeping the peak here avoids confusing the
+        # reserved tensor size with effective KV occupancy in resource runs.
+        self.local_cache_peak_usage_bytes = 0
         self.remote_cache_usage_bytes = 0
         self.local_storage_usage_bytes = 0
 
@@ -315,6 +320,22 @@ class LMCStatsMonitor:
     @thread_safe
     def update_local_cache_usage(self, usage: int):
         self.local_cache_usage_bytes = usage
+        self.local_cache_peak_usage_bytes = max(
+            self.local_cache_peak_usage_bytes, usage
+        )
+
+    @thread_safe
+    def get_local_cache_usage_snapshot(self) -> tuple[int, int, int]:
+        """Return current bytes, lifetime peak bytes, and live objects.
+
+        Unlike ``get_stats_and_clear``, this read does not consume interval
+        counters and is therefore safe to attach to request profiles.
+        """
+        return (
+            int(self.local_cache_usage_bytes),
+            int(self.local_cache_peak_usage_bytes),
+            int(self.active_memory_objs_count),
+        )
 
     @thread_safe
     def update_remote_cache_usage(self, usage: int):

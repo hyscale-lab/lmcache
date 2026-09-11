@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 # Third Party
 from vllm.attention import Attention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
-from vllm.vllm_flash_attn import flash_attn_varlen_func, get_scheduler_metadata
+from vllm.vllm_flash_attn import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+    get_scheduler_metadata,
+)
 import torch
 
 # First Party
@@ -89,6 +93,40 @@ class LMCFlashAttnBackend(AttentionInterface):
             v_descale=self.vllm_attn._v_scale.expand(descale_shape),
         )
 
+        return output
+
+    def forward_scattered_shared_cache(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cache_batch_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                "batched partial attention requires fp16 or bf16"
+            )
+        if cache_seqlens.numel() != query.shape[0]:
+            raise RuntimeError(
+                "batched partial-attention positions do not match the query batch"
+            )
+
+        flash_attn_with_kvcache(
+            q=query.unsqueeze(1),
+            k_cache=key.unsqueeze(0),
+            v_cache=value.unsqueeze(0),
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+            out=output.unsqueeze(1),
+            softmax_scale=self.vllm_attn_impl.scale,
+            causal=True,
+            alibi_slopes=self.vllm_attn_impl.alibi_slopes,
+            window_size=self.vllm_attn_impl.sliding_window,
+            softcap=self.vllm_attn_impl.logits_soft_cap,
+            fa_version=2,
+        )
         return output
 
     def _schedule(

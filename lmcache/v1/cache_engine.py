@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -56,6 +57,52 @@ from lmcache.v1.token_database import (
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class LayerwiseRetrievalRequest:
+    request_id: str
+    tokens: Union[torch.Tensor, list[int]]
+    mask: Optional[torch.Tensor]
+    slot_mapping: torch.Tensor
+    cache_positions: Optional[torch.Tensor] = None
+    request_configs: Optional[dict] = None
+    protected_prefix_tokens: int = 0
+
+    def __post_init__(self):
+        num_tokens = len(self.tokens)
+        if not self.request_id:
+            raise ValueError("request_id must not be empty")
+        if len(self.slot_mapping) != num_tokens:
+            raise ValueError("slot_mapping must match the token count")
+        if self.mask is not None and len(self.mask) != num_tokens:
+            raise ValueError("mask must match the token count")
+        if self.cache_positions is not None:
+            if self.cache_positions.ndim not in (1, 2):
+                raise ValueError("cache_positions must be [T] or [3, T]")
+            if self.cache_positions.shape[-1] != num_tokens:
+                raise ValueError("cache_positions must match the token count")
+            if self.cache_positions.ndim == 2:
+                if self.cache_positions.shape[0] != 3:
+                    raise ValueError("2D cache_positions must have shape [3, T]")
+        if not 0 <= self.protected_prefix_tokens <= num_tokens:
+            raise ValueError("protected prefix must fit in the token sequence")
+
+
+@dataclass(frozen=True)
+class LayerwiseRetrievalBatchInfo:
+    masks: tuple[torch.Tensor, ...]
+
+    def __post_init__(self):
+        if not self.masks:
+            raise ValueError("batch retrieval info must not be empty")
+        for mask in self.masks:
+            if mask.ndim != 1 or mask.dtype != torch.bool:
+                raise ValueError("retrieval masks must be one-dimensional bool tensors")
+
+    @property
+    def counts(self) -> tuple[int, ...]:
+        return tuple(int(mask.sum()) for mask in self.masks)
+
+
 def _prefix_context_hashes(
     tokens: Union[torch.Tensor, list[int]],
     ends: list[int],
@@ -79,8 +126,18 @@ def _prefix_context_hashes(
     return hashes
 
 
+def _retrieval_start(mask: Optional[torch.Tensor]) -> int:
+    if mask is None:
+        return 0
+    return int(mask.numel() - mask.to(dtype=torch.int64).sum().item())
+
+
 def _classify_layer_group(storage_manager, layer_keys):
     """Classify a layer group as absent, partial, or complete."""
+    if hasattr(storage_manager, "layer_group_publication_state"):
+        publication = storage_manager.layer_group_publication_state(layer_keys)
+        if publication in ("writing", "aborted"):
+            return "absent", [None] * len(layer_keys)
     if hasattr(storage_manager, "batched_get_locations"):
         locations = storage_manager.batched_get_locations(layer_keys)
     else:
@@ -463,6 +520,8 @@ class LMCacheEngine:
             memory_objs.append(memory_objs_multi_layer)
             tot_token_num += num_tokens
 
+        publication_groups = [list(group) for group in keys]
+        publication_committed = False
         mem_obj_consumer = None
         if keys:
             # Transpose the keys and memory objects into layer major format
@@ -482,16 +541,26 @@ class LMCacheEngine:
             transfer_kwargs["cache_context_hashes"] = _prefix_context_hashes(
                 tokens, ends,
             )
-            mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs, starts, ends, **transfer_kwargs
-            )
-
-            next(mem_obj_generator)
-
-            for layer_id in range(self.num_layers):
-                yield
+            for group in publication_groups:
+                self.storage_manager.begin_layer_group_publication(group)
+            try:
+                mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                    memory_objs, starts, ends, **transfer_kwargs
+                )
                 next(mem_obj_generator)
-                self.storage_manager.batched_put(keys[layer_id], memory_objs[layer_id])
+                for layer_id in range(self.num_layers):
+                    yield
+                    next(mem_obj_generator)
+                    self.storage_manager.batched_put(
+                        keys[layer_id], memory_objs[layer_id]
+                    )
+                for group in publication_groups:
+                    self.storage_manager.commit_layer_group_publication(group)
+                publication_committed = True
+            finally:
+                if not publication_committed:
+                    for group in publication_groups:
+                        self.storage_manager.abort_layer_group_publication(group)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -721,7 +790,7 @@ class LMCacheEngine:
             ends.append(end)
             keys.append(keys_multi_layer)
 
-            ret_mask[start:end] = True
+            ret_mask[max(start, _retrieval_start(mask)):end] = True
 
         total_chunk_tokens = 0
         if starts:
@@ -775,6 +844,14 @@ class LMCacheEngine:
                 task = next(get_generator)
 
                 assert task is not None
+                if len(task) != len(starts) or any(
+                    memory_obj is None for memory_obj in task
+                ):
+                    raise RuntimeError(
+                        "cache entry changed after layerwise preflight: "
+                        f"layer={layer_id}, expected={len(starts)}, "
+                        f"received={len(task)}"
+                    )
 
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
@@ -859,6 +936,167 @@ class LMCacheEngine:
             )
 
         yield ret_mask
+
+    @_lmcache_nvtx_annotate
+    def retrieve_layer_batch(
+        self,
+        requests: List[LayerwiseRetrievalRequest],
+        **kwargs,
+    ) -> Generator[
+        Optional[Union[LayerwiseRetrievalBatchInfo, List[torch.Tensor]]],
+        None,
+        None,
+    ]:
+        if not requests:
+            raise ValueError("retrieve_layer_batch requires at least one request")
+        if not isinstance(
+            self.gpu_connector, VLLMBufferLayerwiseGPUConnector,
+        ):
+            raise TypeError(
+                "retrieve_layer_batch requires the vLLM buffer connector"
+            )
+
+        starts_per_request = []
+        ends_per_request = []
+        keys_per_request = []
+        masks = []
+        locations = []
+        required_token_counts = []
+
+        for request in requests:
+            required_tokens = (
+                int(request.mask.sum())
+                if request.mask is not None
+                else len(request.tokens)
+            )
+            required_token_counts.append(required_tokens)
+            ret_mask = torch.zeros(
+                len(request.tokens), dtype=torch.bool, device="cpu",
+            )
+            starts = []
+            ends = []
+            chunk_keys = []
+            request_location = None
+
+            for start, end, key in self.token_database.process_tokens(
+                tokens=request.tokens,
+                mask=request.mask,
+                request_configs=request.request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                layer_keys = key.split_layers(self.num_layers)
+                state, layer_locations = _classify_layer_group(
+                    self.storage_manager, layer_keys,
+                )
+                if state == "absent":
+                    break
+                if state == "partial":
+                    raise RuntimeError(
+                        "partial-layer cache entry detected for "
+                        f"request={request.request_id} range=[{start}, {end})"
+                    )
+                location = layer_locations[0]
+                if request_location is None:
+                    request_location = location
+                elif request_location != location:
+                    raise RuntimeError(
+                        "one request spans multiple cache locations: "
+                        f"request={request.request_id}"
+                    )
+                starts.append(start)
+                ends.append(end)
+                chunk_keys.append(layer_keys)
+                ret_mask[max(start, _retrieval_start(request.mask)):end] = True
+
+            if not starts:
+                raise RuntimeError(
+                    "batched cache fetch has no retrievable prefix for "
+                    f"request={request.request_id}"
+                )
+            starts_per_request.append(starts)
+            ends_per_request.append(ends)
+            keys_per_request.append(
+                [list(row) for row in zip(*chunk_keys, strict=True)]
+            )
+            masks.append(ret_mask)
+            locations.append(request_location)
+
+        if len(set(locations)) != 1:
+            raise RuntimeError(
+                "batched cache fetch requires one shared storage location"
+            )
+        monitor_ids = [
+            self.stats_monitor.on_retrieve_request(required_tokens)
+            for required_tokens in required_token_counts
+        ]
+
+        layer_keys = [
+            [
+                key
+                for request_keys in keys_per_request
+                for key in request_keys[layer_id]
+            ]
+            for layer_id in range(self.num_layers)
+        ]
+        get_generator = self.storage_manager.layerwise_batched_get_sync(
+            layer_keys, location=locations[0],
+        )
+        transfer_kwargs = dict(kwargs)
+        consumer = self.gpu_connector.batched_to_gpu_multi(
+            starts_per_request,
+            ends_per_request,
+            [request.slot_mapping for request in requests],
+            [request.cache_positions for request in requests],
+            [
+                _prefix_context_hashes(request.tokens, ends)
+                for request, ends in zip(
+                    requests, ends_per_request, strict=True,
+                )
+            ],
+            protected_prefix_tokens=[
+                request.protected_prefix_tokens for request in requests
+            ],
+            **transfer_kwargs,
+        )
+        next(consumer)
+        memory_objects = []
+        try:
+            for layer_id in range(self.num_layers):
+                objects = next(get_generator)
+                if objects is None:
+                    raise RuntimeError(
+                        f"storage returned no objects for layer {layer_id}"
+                    )
+                expected_objects = sum(
+                    len(starts) for starts in starts_per_request
+                )
+                if len(objects) != expected_objects or any(
+                    memory_obj is None for memory_obj in objects
+                ):
+                    raise RuntimeError(
+                        "cache entry changed after batch preflight: "
+                        f"layer={layer_id}, expected={expected_objects}, "
+                        f"received={len(objects)}"
+                    )
+                if layer_id == 0:
+                    yield LayerwiseRetrievalBatchInfo(tuple(masks))
+                else:
+                    yield None
+                consumer.send(objects)
+                memory_objects.extend(objects)
+
+            yield None
+            next(consumer)
+        finally:
+            for memory_obj in memory_objects:
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+
+        for monitor_id, mask in zip(monitor_ids, masks, strict=True):
+            self.stats_monitor.on_retrieve_finished(
+                monitor_id, int(mask.sum()),
+            )
+        yield masks
 
     @_lmcache_nvtx_annotate
     def lookup(
@@ -1331,7 +1569,7 @@ class LMCacheEngine:
             memory_obj = memory_objs[idx]
             chunks.append((key, memory_obj, start, end))
             tot_kv_size += memory_obj.get_size()
-            ret_mask[start:end] = True
+            ret_mask[max(start, _retrieval_start(mask)):end] = True
             used_indices.add(idx)
 
         for idx, unused_mem_obj in enumerate(memory_objs):
@@ -1406,7 +1644,7 @@ class LMCacheEngine:
                 # NOTE: Here we make the assumption that the underlying
                 # storage backend support pin operation, and the memory
                 # object is already pinned in the storage backend.
-                ret_mask[start:end] = True
+                ret_mask[max(start, _retrieval_start(mask)):end] = True
 
             assert location is not None
 

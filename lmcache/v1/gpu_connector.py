@@ -22,6 +22,42 @@ if torch.cuda.is_available():
 logger = init_logger(__name__)
 
 
+def _group_writeback_chunks(
+    starts: List[int],
+    ends: List[int],
+    max_tokens: int,
+) -> List[List[int]]:
+    """Group cache chunks without splitting an allocated memory object.
+
+    A zero limit preserves the original one-buffer-per-request behavior.  A
+    chunk larger than the limit remains a single group because its destination
+    ``MemoryObj`` cannot be split here.
+    """
+    if len(starts) != len(ends):
+        raise ValueError("writeback starts and ends must have equal length")
+    if not starts:
+        return []
+    if max_tokens <= 0:
+        return [list(range(len(starts)))]
+
+    groups: List[List[int]] = []
+    current: List[int] = []
+    current_tokens = 0
+    for index, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        chunk_tokens = end - start
+        if chunk_tokens <= 0:
+            raise ValueError("writeback chunks must contain at least one token")
+        if current and current_tokens + chunk_tokens > max_tokens:
+            groups.append(current)
+            current = []
+            current_tokens = 0
+        current.append(index)
+        current_tokens += chunk_tokens
+    if current:
+        groups.append(current)
+    return groups
+
+
 def _context_hashes_match(memory_objs, expected_hashes) -> bool:
     if expected_hashes is None or len(memory_objs) != len(expected_hashes):
         return False
@@ -402,6 +438,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        current_stream = torch.cuda.current_stream()
         profile = os.environ.get("LMCACHE_PROFILE_RETRIEVAL", "0") == "1"
         if profile:
             start_event = torch.cuda.Event(enable_timing=True)
@@ -420,6 +457,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             end_event.synchronize()
             elapsed_ms = start_event.elapsed_time(end_event)
             logger.info("batched_to_gpu cost %.3f ms", elapsed_ms)
+        current_stream.wait_stream(self.load_stream)
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
@@ -557,6 +595,33 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         raise NotImplementedError
 
+    @staticmethod
+    def _unprotected_ranges(
+        length: int,
+        protected_ranges: List[Tuple[int, int]],
+    ) -> List[Tuple[int, int]]:
+        if length < 0:
+            raise ValueError("buffer length must be non-negative")
+        merged: List[List[int]] = []
+        for start, end in sorted(protected_ranges):
+            if not 0 <= start <= end <= length:
+                raise ValueError("protected range is outside the load buffer")
+            if start == end:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        result = []
+        cursor = 0
+        for start, end in merged:
+            if cursor < start:
+                result.append((cursor, start))
+            cursor = end
+        if cursor < length:
+            result.append((cursor, length))
+        return result
+
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """ """
 
@@ -590,13 +655,31 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         expected_context_hashes = kwargs.get("cache_context_hashes")
-        self.current_positions_unchanged = False
-        self.current_exact_prefix_match = False
+        allow_exact_prefix_match = kwargs.get(
+            "allow_exact_prefix_match", True,
+        )
+        positions_unchanged = False
+        exact_prefix_match = False
+        self.current_positions_unchanged = positions_unchanged
+        self.current_exact_prefix_match = exact_prefix_match
 
         self._lazy_initialize_buffer(self.kvcaches)
 
         num_all_tokens = ends[-1] - starts[0]
         slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
+        protected_ranges = list(kwargs.get("protected_ranges") or ())
+        protected_prefix_tokens = int(
+            kwargs.get("protected_prefix_tokens", 0)
+        )
+        protected_end = min(
+            num_all_tokens,
+            max(0, protected_prefix_tokens - starts[0]),
+        )
+        if protected_end:
+            protected_ranges.append((0, protected_end))
+        write_ranges = self._unprotected_ranges(
+            num_all_tokens, protected_ranges,
+        )
 
         # compute gap positions
         gap_mask = torch.ones(
@@ -607,7 +690,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         for start, end in zip(starts, ends, strict=False):
             gap_mask[start - buf_offset : end - buf_offset] = False
 
-        self.current_gap_positions = torch.where(gap_mask)[0]
+        gap_positions = torch.where(gap_mask)[0]
+        buffer_mapping: dict[int, MemoryObj] = {}
+        self.current_gap_positions = gap_positions
+        self.buffer_mapping = buffer_mapping
 
         buf_offset = starts[0]
         if self.cache_positions:
@@ -652,18 +738,21 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     store_start = torch.cuda.Event(enable_timing=True)
                     store_end = torch.cuda.Event(enable_timing=True)
                     store_start.record(stream)
-                lmc_ops.single_layer_kv_transfer(
-                    self.buffer_mapping[layer_id - 2].tensor,
-                    self.kvcaches[layer_id - 2],
-                    slot_mapping_full,
-                    False,
-                    False,  # shape is [2, num_tokens, hidden_dim]
-                    self.vllm_two_major,
-                )
+                source = buffer_mapping[layer_id - 2].tensor
+                assert source is not None
+                for write_start, write_end in write_ranges:
+                    lmc_ops.single_layer_kv_transfer(
+                        source[:, write_start:write_end].contiguous(),
+                        self.kvcaches[layer_id - 2],
+                        slot_mapping_full[write_start:write_end],
+                        False,
+                        False,
+                        self.vllm_two_major,
+                    )
                 if timing:
                     store_end.record(stream)
                     store_events = (store_start, store_end)
-                del self.buffer_mapping[layer_id - 2]
+                del buffer_mapping[layer_id - 2]
 
                 logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
 
@@ -680,7 +769,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     rope_start = torch.cuda.Event(enable_timing=True)
                     rope_end = torch.cuda.Event(enable_timing=True)
                     rope_start.record(stream)
-                if self.cache_positions and not self.current_positions_unchanged:
+                if self.cache_positions and not positions_unchanged:
                     assert compute_gpu_buffer_obj.tensor is not None
                     self._ensure_position_repair_initialized()
 
@@ -703,10 +792,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         )
 
                 # gap zeroing after RoPE
-                if self.current_gap_positions.numel():
-                    compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
+                if gap_positions.numel():
+                    compute_gpu_buffer_obj.tensor[:, gap_positions] = 0.0
 
-                self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
+                buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
                 if timing:
                     rope_end.record(stream)
@@ -730,6 +819,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         load_start = torch.cuda.Event(enable_timing=True)
                         load_end = torch.cuda.Event(enable_timing=True)
                         load_start.record(self.load_stream)
+                    ready_events: set[int] = set()
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -742,6 +832,14 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                             continue
                         assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
                         assert load_gpu_buffer_obj.tensor is not None
+
+                        ready_event = memory_obj.metadata.ready_event
+                        if (
+                            ready_event is not None
+                            and id(ready_event) not in ready_events
+                        ):
+                            self.load_stream.wait_event(ready_event)
+                            ready_events.add(id(ready_event))
 
                         load_gpu_buffer_obj.tensor[:, s:e].copy_(memory_obj.tensor, non_blocking=True)
 
@@ -760,35 +858,40 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     new_gap_indices = []
                     for gs, ge in evicted_ranges:
                         new_gap_indices.append(
-                            torch.arange(gs, ge, device=self.current_gap_positions.device)
+                            torch.arange(gs, ge, device=gap_positions.device)
                         )
                     extra_gaps = torch.cat(new_gap_indices)
-                    self.current_gap_positions = torch.cat(
-                        [self.current_gap_positions, extra_gaps]
+                    gap_positions = torch.cat(
+                        [gap_positions, extra_gaps]
                     ).unique()
+                    self.current_gap_positions = gap_positions
                     logger.warning(
                         "batched_to_gpu: %d evicted chunk(s) on layer %d; "
                         "added %d positions to gap mask",
                         len(evicted_ranges), layer_id, extra_gaps.numel(),
                     )
                 if layer_id == 0:
-                    no_gaps = self.current_gap_positions.numel() == 0
-                    self.current_positions_unchanged = (
-                        no_gaps
+                    no_gaps = gap_positions.numel() == 0
+                    positions_unchanged = (
+                        self.cache_positions
+                        and no_gaps
                         and torch.equal(old_positions_full, new_positions_full)
                     )
-                    self.current_exact_prefix_match = (
-                        starts[0] == 0
-                        and self.current_positions_unchanged
+                    exact_prefix_match = (
+                        allow_exact_prefix_match
+                        and starts[0] == 0
+                        and positions_unchanged
                         and context_hashes_match
                     )
+                    self.current_positions_unchanged = positions_unchanged
+                    self.current_exact_prefix_match = exact_prefix_match
                     logger.debug(
                         "LMCache reuse classification: exact_prefix=%s, "
                         "positions_unchanged=%s, context_match=%s, gaps=%d",
-                        self.current_exact_prefix_match,
-                        self.current_positions_unchanged,
+                        exact_prefix_match,
+                        positions_unchanged,
                         context_hashes_match,
-                        int(self.current_gap_positions.numel()),
+                        int(gap_positions.numel()),
                     )
 
             elif layer_id == self.num_layers:
@@ -835,12 +938,146 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         load_gpu_buffer_obj.ref_count_down()
         compute_gpu_buffer_obj.ref_count_down()
 
-        assert len(self.buffer_mapping) == 0, (
+        assert len(buffer_mapping) == 0, (
             "There are still layers in the buffer mapping after "
             "releasing the GPU buffers."
         )
 
         yield
+
+    @staticmethod
+    def _coalesced_layout(
+        request_starts: List[List[int]],
+        request_ends: List[List[int]],
+    ) -> tuple[
+        int,
+        list[tuple[int, int, int]],
+        list[tuple[int, int]],
+        list[tuple[int, int]],
+    ]:
+        if not request_starts or len(request_starts) != len(request_ends):
+            raise ValueError("request chunk boundaries must be parallel")
+
+        segments = []
+        chunk_slices = []
+        gap_ranges = []
+        offset = 0
+        for starts, ends in zip(request_starts, request_ends, strict=True):
+            if not starts or len(starts) != len(ends):
+                raise ValueError("each request must contain matched chunks")
+            if any(start >= end for start, end in zip(starts, ends, strict=True)):
+                raise ValueError("chunk ranges must be non-empty")
+            if starts != sorted(starts) or ends != sorted(ends):
+                raise ValueError("chunk ranges must be ordered")
+            if any(
+                end > next_start
+                for end, next_start in zip(ends[:-1], starts[1:], strict=True)
+            ):
+                raise ValueError("chunk ranges must not overlap")
+
+            source_start = starts[0]
+            source_end = ends[-1]
+            num_tokens = source_end - source_start
+            segments.append((offset, source_start, num_tokens))
+            cursor = source_start
+            for start, end in zip(starts, ends, strict=True):
+                if cursor < start:
+                    gap_ranges.append(
+                        (offset + cursor - source_start,
+                         offset + start - source_start)
+                    )
+                chunk_slices.append(
+                    (offset + start - source_start,
+                     offset + end - source_start)
+                )
+                cursor = end
+            offset += num_tokens
+
+        return offset, segments, chunk_slices, gap_ranges
+
+    @_lmcache_nvtx_annotate
+    def batched_to_gpu_multi(
+        self,
+        request_starts: List[List[int]],
+        request_ends: List[List[int]],
+        slot_mappings: List[torch.Tensor],
+        cache_positions: List[Optional[torch.Tensor]],
+        cache_context_hashes: List[List[bytes]],
+        protected_prefix_tokens: Optional[List[int]] = None,
+        **kwargs,
+    ):
+        if not (
+            len(request_starts)
+            == len(request_ends)
+            == len(slot_mappings)
+            == len(cache_positions)
+            == len(cache_context_hashes)
+        ):
+            raise ValueError("batched retrieval inputs must be parallel")
+
+        _, segments, chunk_slices, _ = self._coalesced_layout(
+            request_starts, request_ends,
+        )
+        if protected_prefix_tokens is None:
+            protected_prefix_tokens = [0] * len(segments)
+        if len(protected_prefix_tokens) != len(segments):
+            raise ValueError("protected prefixes must align with requests")
+        protected_ranges = []
+        for index, ((offset, source_start, length), prefix) in enumerate(zip(
+            segments, protected_prefix_tokens, strict=True,
+        )):
+            if not 0 <= prefix <= len(slot_mappings[index]):
+                raise ValueError("protected prefix is outside the request")
+            protected = min(length, max(0, prefix - source_start))
+            if protected:
+                protected_ranges.append((offset, offset + protected))
+        for index, (_, start, length) in enumerate(segments):
+            if start + length > len(slot_mappings[index]):
+                raise ValueError("slot mapping does not cover its request span")
+            positions = cache_positions[index]
+            if positions is not None and start + length > positions.shape[-1]:
+                raise ValueError("positions do not cover their request span")
+            if len(cache_context_hashes[index]) != len(request_starts[index]):
+                raise ValueError("context hashes must align with request chunks")
+        combined_slots = torch.cat(
+            [
+                slot_mappings[index][start:start + length]
+                for index, (_, start, length) in enumerate(segments)
+            ],
+        )
+
+        position_parts = []
+        position_ndim = None
+        for index, (_, start, length) in enumerate(segments):
+            positions = cache_positions[index]
+            if positions is None:
+                positions = torch.arange(
+                    len(slot_mappings[index]),
+                    dtype=torch.int64,
+                    device=combined_slots.device,
+                )
+            if position_ndim is None:
+                position_ndim = positions.ndim
+            elif positions.ndim != position_ndim:
+                raise ValueError("batched requests must use one position mode")
+            position_parts.append(positions[..., start:start + length])
+        combined_positions = torch.cat(position_parts, dim=-1)
+
+        transfer_kwargs = dict(kwargs)
+        transfer_kwargs.update(
+            slot_mapping=combined_slots,
+            cache_positions=combined_positions,
+            cache_context_hashes=[
+                value
+                for request_hashes in cache_context_hashes
+                for value in request_hashes
+            ],
+            allow_exact_prefix_match=False,
+            protected_ranges=protected_ranges,
+        )
+        starts = [start for start, _ in chunk_slices]
+        ends = [end for _, end in chunk_slices]
+        yield from self.batched_to_gpu(starts, ends, **transfer_kwargs)
 
     # TODO(Jiayi): Reduce repetitive operations in `batched_to_gpu`
     # and `batched_from_gpu`.
@@ -890,9 +1127,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         self._lazy_initialize_buffer(self.kvcaches)
 
-        buf_start = 0
         slot_mapping_chunks = []
-        buf_starts_ends = []
         old_positions_chunks = []
         context_hashes = kwargs.get("cache_context_hashes")
         if context_hashes is None:
@@ -902,10 +1137,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 "cache_context_hashes must align with stored cache chunks"
             )
         for start, end in zip(starts, ends, strict=False):
-            buf_end = buf_start + end - start
-            buf_starts_ends.append((buf_start, buf_end))
             slot_mapping_chunks.append(slot_mapping[start:end])
-            buf_start = buf_end
             if self.cache_positions:
                 requested_positions = kwargs.get("cache_positions")
                 if requested_positions is not None:
@@ -922,65 +1154,151 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                         )
                     )
 
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
-
-        num_tokens = len(slot_mapping_full)
-        buffer_shape = self.get_shape(num_tokens)
-        assert self.gpu_buffer_allocator is not None
-        tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-            buffer_shape, self.dtype, MemoryFormat.KV_2TD
+        max_writeback_tokens = int(
+            os.environ.get("LMCACHE_MAX_GPU_WRITEBACK_TOKENS", "0")
         )
-        assert tmp_gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
+        writeback_groups = _group_writeback_chunks(
+            starts, ends, max_writeback_tokens,
         )
-        assert tmp_gpu_buffer_obj.tensor is not None
+        group_slot_mappings = [
+            torch.cat([slot_mapping_chunks[index] for index in group], dim=0)
+            for group in writeback_groups
+        ]
+        buffer_tokens = max(len(mapping) for mapping in group_slot_mappings)
+        if len(writeback_groups) > 1:
+            logger.info(
+                "Splitting %d-token GPU writeback into %d groups with a "
+                "%d-token reusable buffer (configured limit=%d)",
+                sum(len(mapping) for mapping in group_slot_mappings),
+                len(writeback_groups),
+                buffer_tokens,
+                max_writeback_tokens,
+            )
 
         current_stream = torch.cuda.current_stream()
+        defer_layer_sync = bool(kwargs.get("defer_layer_sync", False))
+        direct_memory_writeback = bool(
+            kwargs.get("direct_memory_writeback", False)
+        )
+        async_publication = bool(kwargs.get("async_publication", False))
+        writeback_state = kwargs.get("writeback_state")
+        if direct_memory_writeback and not defer_layer_sync:
+            raise ValueError(
+                "direct memory writeback requires deferred layer sync"
+            )
+        if async_publication and not direct_memory_writeback:
+            raise ValueError(
+                "async publication requires direct memory writeback"
+            )
+
+        if async_publication:
+            pinned_memory_objs = [
+                memory_obj
+                for layer_objs in memory_objs
+                for memory_obj in layer_objs
+            ]
+            for memory_obj in pinned_memory_objs:
+                memory_obj.pin()
+            if writeback_state is not None:
+                writeback_state["pinned_memory_objs"] = pinned_memory_objs
+
+        tmp_gpu_buffer_obj = None
+        if not direct_memory_writeback:
+            buffer_shape = self.get_shape(buffer_tokens)
+            assert self.gpu_buffer_allocator is not None
+            tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                buffer_shape, self.dtype, MemoryFormat.KV_2TD
+            )
+            assert tmp_gpu_buffer_obj is not None, (
+                "Failed to allocate GPU buffer in GPUConnector"
+            )
+            assert tmp_gpu_buffer_obj.tensor is not None
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
-                lmc_ops.single_layer_kv_transfer(
-                    tmp_gpu_buffer_obj.tensor,
-                    self.kvcaches[layer_id],
-                    slot_mapping_full,
-                    True,
-                    False,  # shape is [2, num_tokens, hidden_dim]
-                    self.vllm_two_major,
-                )
-                for (
-                    (buf_start, buf_end),
-                    memory_obj,
-                    old_positions,
-                    context_hash,
-                ) in zip(
-                    buf_starts_ends,
-                    memory_objs_layer,
-                    old_positions_chunks,
-                    context_hashes,
-                    strict=False,
-                ):
-                    assert memory_obj.tensor is not None
-                    memory_obj.tensor[0].copy_(
-                        tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
-                        non_blocking=True,
-                    )
-                    memory_obj.tensor[1].copy_(
-                        tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
-                        non_blocking=True,
-                    )
-                    if self.cache_positions:
-                        memory_obj.metadata.cached_positions = old_positions
-                    memory_obj.metadata.cached_context_hash = context_hash
+                if direct_memory_writeback:
+                    for index, chunk_slots in enumerate(slot_mapping_chunks):
+                        memory_obj = memory_objs_layer[index]
+                        assert memory_obj.tensor is not None
+                        lmc_ops.single_layer_kv_transfer(
+                            memory_obj.tensor,
+                            self.kvcaches[layer_id],
+                            chunk_slots,
+                            True,
+                            False,
+                            self.vllm_two_major,
+                        )
+                        if self.cache_positions:
+                            memory_obj.metadata.cached_positions = (
+                                old_positions_chunks[index]
+                            )
+                        memory_obj.metadata.cached_context_hash = (
+                            context_hashes[index]
+                        )
+                else:
+                    assert tmp_gpu_buffer_obj is not None
+                    assert tmp_gpu_buffer_obj.tensor is not None
+                    for group, group_slots in zip(
+                        writeback_groups, group_slot_mappings, strict=True,
+                    ):
+                        lmc_ops.single_layer_kv_transfer(
+                            tmp_gpu_buffer_obj.tensor,
+                            self.kvcaches[layer_id],
+                            group_slots,
+                            True,
+                            False,
+                            self.vllm_two_major,
+                        )
+                        group_offset = 0
+                        for index in group:
+                            chunk_tokens = ends[index] - starts[index]
+                            group_end = group_offset + chunk_tokens
+                            memory_obj = memory_objs_layer[index]
+                            assert memory_obj.tensor is not None
+                            memory_obj.tensor[0].copy_(
+                                tmp_gpu_buffer_obj.tensor[0][
+                                    group_offset:group_end
+                                ],
+                                non_blocking=True,
+                            )
+                            memory_obj.tensor[1].copy_(
+                                tmp_gpu_buffer_obj.tensor[1][
+                                    group_offset:group_end
+                                ],
+                                non_blocking=True,
+                            )
+                            if self.cache_positions:
+                                memory_obj.metadata.cached_positions = (
+                                    old_positions_chunks[index]
+                                )
+                            memory_obj.metadata.cached_context_hash = (
+                                context_hashes[index]
+                            )
+                            group_offset = group_end
 
             yield
-            self.store_stream.synchronize()
+            if not defer_layer_sync:
+                self.store_stream.synchronize()
             logger.debug(f"Finished offloading layer {layer_id}")
 
+        if defer_layer_sync:
+            completion_event = torch.cuda.Event()
+            completion_event.record(self.store_stream)
+            if async_publication:
+                for layer_objs in memory_objs:
+                    for memory_obj in layer_objs:
+                        memory_obj.metadata.ready_event = completion_event
+                if writeback_state is not None:
+                    writeback_state["completion_event"] = completion_event
+            else:
+                completion_event.synchronize()
+
         # free the buffer memory
-        tmp_gpu_buffer_obj.ref_count_down()
+        if tmp_gpu_buffer_obj is not None:
+            tmp_gpu_buffer_obj.ref_count_down()
         yield
 
     def get_shape(self, num_tokens: int) -> torch.Size:

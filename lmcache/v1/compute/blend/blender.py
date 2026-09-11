@@ -68,6 +68,12 @@ class LMCBlender:
         self.vlcache_mode = str(
             getattr(config, "vlcache_mode", "per_frame")
         )
+        self.topk_visual_only = False
+        self.cacheblend_batched_partial_attention = False
+        self.vlcache_batched_partial_attention = False
+        self.random_batched_partial_attention = False
+        self.random_recompute_ratio = 0.0625
+        self.random_seed = 1701
         logger.info("Blender blend_mode=%s, GOP=%d, vlcache_ratio=%.3f, vlcache_mode=%s",
                      self.blend_mode, self.gop, self.vlcache_recompute_ratio,
                      self.vlcache_mode)
@@ -94,6 +100,30 @@ class LMCBlender:
         self._time_sel = os.environ.get("LMCACHE_TIME_SELECTION") == "1"
         self._equal_k = os.environ.get("LMCACHE_EQUAL_K") == "1"
         if config.extra_config is not None:
+            self.topk_visual_only = bool(
+                config.extra_config.get("topk_visual_only", False)
+            )
+            self.cacheblend_batched_partial_attention = bool(
+                config.extra_config.get(
+                    "cacheblend_batched_partial_attention", False
+                )
+            )
+            self.vlcache_batched_partial_attention = bool(
+                config.extra_config.get(
+                    "vlcache_batched_partial_attention", False
+                )
+            )
+            self.random_batched_partial_attention = bool(
+                config.extra_config.get(
+                    "random_batched_partial_attention", False
+                )
+            )
+            self.random_recompute_ratio = float(
+                config.extra_config.get("random_recompute_ratio", 0.0625)
+            )
+            self.random_seed = int(
+                config.extra_config.get("random_seed", 1701)
+            )
             self.skip_ffn = bool(config.extra_config.get("skip_ffn", False))
             self.skip_ffn_only_codecsight = bool(
                 config.extra_config.get("skip_ffn_only_codecsight", True)
@@ -107,6 +137,39 @@ class LMCBlender:
                     "codecsight_refresh_frames",
                     config.extra_config.get("codecsight_prefix_frames", 3),
                 )
+            )
+        if self.blend_mode == "topk":
+            logger.info(
+                "CacheBlend candidate domain: %s; partial_attention=%s",
+                "visual cache-hit tokens" if self.topk_visual_only
+                else "all cache-hit tokens",
+                "shared_kv_batch"
+                if self.cacheblend_batched_partial_attention
+                else "blockwise",
+            )
+        elif self.cacheblend_batched_partial_attention:
+            raise ValueError(
+                "cacheblend_batched_partial_attention is restricted to "
+                "blend_mode=topk"
+            )
+        if self.vlcache_batched_partial_attention:
+            if self.blend_mode != "vlcache":
+                raise ValueError(
+                    "vlcache_batched_partial_attention is restricted to "
+                    "blend_mode=vlcache"
+                )
+            logger.info(
+                "VLCache partial attention: shared_kv_batch"
+            )
+        if self.random_batched_partial_attention:
+            if self.blend_mode != "random":
+                raise ValueError(
+                    "random_batched_partial_attention is restricted to "
+                    "blend_mode=random"
+                )
+            logger.info(
+                "Random-K candidate domain: visual cache-hit tokens; "
+                "partial attention: shared_kv_batch"
             )
         if self.blend_mode == "codecsight":
             logger.info(
@@ -128,6 +191,7 @@ class LMCBlender:
         )
         # blend() replaces this with request-local metadata.
         self._active_metadata = self.metadata
+        self._last_selection_stats: dict[str, Any] = {}
         self._rotary_by_layer = [
             self._get_rotary_emb(layer.self_attn) for layer in self.layers
         ]
@@ -159,6 +223,25 @@ class LMCBlender:
             return attn_layer.rotary_emb_func
         raise AttributeError("Attention layer does not expose rotary embedding module.")
 
+    def _validate_request_positions(
+        self,
+        positions: torch.Tensor,
+        num_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if not torch.is_tensor(positions):
+            raise RuntimeError("cache positions must be a tensor")
+        if positions.ndim not in (1, 2) or positions.shape[-1] != num_tokens:
+            raise RuntimeError(
+                "cache positions must match the eager refresh token layout: "
+                f"shape={tuple(positions.shape)}, tokens={num_tokens}"
+            )
+        if self.is_mrope and (positions.ndim != 2 or positions.shape[0] != 3):
+            raise RuntimeError(
+                "mRoPE eager refresh requires exact [3, num_tokens] positions"
+            )
+        return positions.to(device=device, dtype=torch.int64)
+
     def _compute_mrope_positions(self, num_tokens: int, device: torch.device) -> torch.Tensor:
         """Compute Qwen3-VL positions with shape [3, num_tokens]."""
         input_ids = self._active_metadata.input_ids
@@ -177,6 +260,7 @@ class LMCBlender:
 
         if image_grid_thw is None:
             image_grid_thw = []
+        mm_positions = self._active_metadata.mm_positions
 
         # Accept nested and flattened vLLM grid metadata.
         try:
@@ -207,6 +291,7 @@ class LMCBlender:
         st = 0
         remain_images, remain_videos = image_nums, video_nums
         image_index, video_index = 0, 0
+        media_index = 0
 
         for _ in range(image_nums + video_nums):
             ed_image = len(input_ids_for_pos) + 1
@@ -254,6 +339,33 @@ class LMCBlender:
             llm_grid_t = t
             llm_grid_h = h // spatial_merge_size
             llm_grid_w = w // spatial_merge_size
+            full_media_len = llm_grid_t * llm_grid_h * llm_grid_w
+            if mm_positions is None or media_index >= len(mm_positions):
+                raise RuntimeError(
+                    "M-RoPE placeholder metadata is missing for grid fallback"
+                )
+            placeholder = mm_positions[media_index]
+            placeholder_start = int(getattr(placeholder, "offset", -1))
+            placeholder_len = int(getattr(placeholder, "length", -1))
+            if placeholder_start != ed or placeholder_len != full_media_len:
+                raise RuntimeError(
+                    "M-RoPE grid fallback cannot represent a pruned or "
+                    "misaligned visual span; exact encoder positions are required"
+                )
+            media_index += 1
+
+            media_token_id = (
+                image_token_id if ed_image < ed_video else video_token_id
+            )
+            available_media_len = 0
+            while (
+                ed + available_media_len < len(input_ids_for_pos)
+                and input_ids_for_pos[ed + available_media_len] == media_token_id
+                and available_media_len < full_media_len
+            ):
+                available_media_len += 1
+            if available_media_len == 0:
+                break
             text_len = ed - st
 
             st_idx = (
@@ -283,10 +395,13 @@ class LMCBlender:
                 .expand(llm_grid_t, llm_grid_h, -1)
                 .flatten()
             )
+            media_positions = torch.stack([t_index, h_index, w_index])
             llm_pos_ids_list.append(
-                torch.stack([t_index, h_index, w_index]) + text_len + st_idx
+                media_positions[:, :available_media_len] + text_len + st_idx
             )
-            st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+            st = ed + available_media_len
+            if available_media_len < full_media_len:
+                break
 
         if st < len(input_ids_for_pos):
             st_idx = (
@@ -380,21 +495,29 @@ class LMCBlender:
 
     def _random_select(
         self,
-        hit_indices: torch.Tensor,
+        candidate_indices: torch.Tensor,
         effective_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Select a deterministic random control with CodecSight's budget."""
-        k = int(self._codecsight_select(hit_indices, effective_len, device).numel())
-        n = int(hit_indices.numel())
+        """Select a deterministic 1/16 control from cached visual tokens."""
+        ratio = float(self.random_recompute_ratio)
+        if not 0.0 < ratio <= 1.0:
+            raise RuntimeError(
+                f"Random-K recompute ratio must be in (0, 1], got {ratio}"
+            )
+        n = int(candidate_indices.numel())
+        k = max(1, int(n * ratio)) if n else 0
         if k <= 0 or n == 0:
-            return hit_indices[:1] if n > 0 else hit_indices
+            return candidate_indices
         if k >= n:
-            return hit_indices
+            return candidate_indices
         g = torch.Generator(device="cpu")
-        g.manual_seed(1234 + effective_len)  # stable across layers/runs
+        # A fixed experiment seed gives reproducible selection.  The visual
+        # contents change from window to window even though token positions do
+        # not, so the selected positions remain an unbiased Random-K control.
+        g.manual_seed(int(self.random_seed) + effective_len)
         perm = torch.randperm(n, generator=g).to(device)
-        sel = hit_indices[perm[:k]]
+        sel = candidate_indices[perm[:k]]
         sel, _ = torch.sort(sel)
         return sel
 
@@ -420,6 +543,19 @@ class LMCBlender:
                 "VLCache selection requires mm_positions; refusing a silent "
                 "prefix-of-all fallback"
             )
+
+        if os.environ.get("COSTREAM_DIAGNOSTIC_REFRESH") == "1":
+            from lmcache.integration.vllm.diagnostic_refresh import visual_positions
+            if r != 0.0625:
+                raise RuntimeError("diagnostic VLCache budget must be 1/16")
+            selected = []
+            for placeholder in mm_positions:
+                visual = torch.tensor(visual_positions(placeholder), device=device, dtype=torch.long)
+                if int(visual[-1]) < effective_len and torch.isin(visual, hit_indices).all():
+                    selected.append(visual[:16])
+            if len(selected) != 64:
+                raise RuntimeError("diagnostic VLCache requires 64 complete cached visual frames")
+            return torch.cat((torch.cat(selected), self._diagnostic_text_indices(effective_len, device))).unique(sorted=True)
 
         logger.debug(
             "vlcache mode=%s: %d frames in mm_positions, effective_len=%d, r=%.4f",
@@ -498,6 +634,110 @@ class LMCBlender:
         budget = max(1, int(all_image_t.numel() * r))
         return all_image_t[:budget]
 
+    @staticmethod
+    def _count_visual_indices(
+        indices: torch.Tensor,
+        mm_positions: Optional[Sequence[Any]],
+        effective_len: int,
+    ) -> int:
+        """Count indices inside clipped multimodal placeholder spans."""
+        if indices.numel() == 0 or not mm_positions:
+            return 0
+        count = 0
+        for placeholder in mm_positions:
+            if os.environ.get("COSTREAM_DIAGNOSTIC_REFRESH") == "1":
+                from lmcache.integration.vllm.diagnostic_refresh import visual_positions
+                visual = torch.tensor(visual_positions(placeholder), device=indices.device)
+                count += int(torch.isin(indices[indices < effective_len], visual).sum())
+                continue
+            start = max(0, int(getattr(placeholder, "offset", 0)))
+            length = max(0, int(getattr(placeholder, "length", 0)))
+            end = min(start + length, effective_len)
+            if start < end:
+                count += int(((indices >= start) & (indices < end)).sum().item())
+        return count
+
+    @staticmethod
+    def _visual_candidate_indices(
+        hit_indices: torch.Tensor,
+        mm_positions: Optional[Sequence[Any]],
+        effective_len: int,
+    ) -> torch.Tensor:
+        """Return cache-hit indices inside multimodal placeholder spans."""
+        if not mm_positions:
+            raise RuntimeError(
+                "visual-only CacheBlend requires mm_positions; refusing an "
+                "all-token fallback"
+            )
+        selected: list[torch.Tensor] = []
+        for placeholder in mm_positions:
+            if os.environ.get("COSTREAM_DIAGNOSTIC_REFRESH") == "1":
+                from lmcache.integration.vllm.diagnostic_refresh import visual_positions
+                visual = torch.tensor(visual_positions(placeholder), device=hit_indices.device)
+                span_hits = hit_indices[(hit_indices < effective_len) & torch.isin(hit_indices, visual)]
+                if span_hits.numel():
+                    selected.append(span_hits)
+                continue
+            start = max(0, int(getattr(placeholder, "offset", 0)))
+            length = max(0, int(getattr(placeholder, "length", 0)))
+            end = min(start + length, effective_len)
+            if start < end:
+                span_hits = hit_indices[
+                    (hit_indices >= start) & (hit_indices < end)
+                ]
+                if span_hits.numel() > 0:
+                    selected.append(span_hits)
+        if not selected:
+            raise RuntimeError(
+                "visual-only CacheBlend found no cached visual candidates"
+            )
+        return torch.cat(selected)
+
+    def _diagnostic_text_indices(self, length, device):
+        from lmcache.integration.vllm.diagnostic_refresh import visual_positions
+        mask = torch.ones(length, dtype=torch.bool, device=device)
+        for placeholder in self._active_metadata.mm_positions:
+            visual = torch.tensor(visual_positions(placeholder), device=device)
+            mask[visual[visual < length]] = False
+        return torch.arange(length, device=device)[mask]
+
+    def _record_selection_stats(
+        self,
+        *,
+        selected_indices: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        effective_len: int,
+        layer_id: int,
+        mode: str,
+    ) -> None:
+        """Persist request-local controlled recompute-budget counters."""
+        mm_positions = self._active_metadata.mm_positions
+        candidate_visual = self._count_visual_indices(
+            candidate_indices, mm_positions, effective_len)
+        selected_visual = self._count_visual_indices(
+            selected_indices, mm_positions, effective_len)
+        stats = {
+            "recompute_selection_mode": mode,
+            "recompute_selection_layer": int(layer_id),
+            "recompute_candidate_tokens": int(candidate_indices.numel()),
+            "recompute_selected_tokens": int(selected_indices.numel()),
+            "recompute_candidate_visual_tokens": candidate_visual,
+            "recompute_selected_visual_tokens": selected_visual,
+            "recompute_visual_ratio": (
+                selected_visual / candidate_visual
+                if candidate_visual else None
+            ),
+        }
+        self._active_metadata.selection_stats = stats
+        if (os.environ.get("COSTREAM_DIAGNOSTIC_REFRESH") == "1"
+                and os.environ.get("COSTREAM_DIAGNOSTIC_AUDIT", "1") == "1"):
+            stats["diagnostic_refresh_visual_positions"] = selected_indices.cpu().tolist()
+            stats["diagnostic_candidate_positions"] = candidate_indices.cpu().tolist()
+            stats["diagnostic_mm_positions"] = [
+                [int(p.offset), int(p.length)] for p in (mm_positions or [])
+            ]
+        self._last_selection_stats = dict(stats)
+
     def _apply_selected_indices(
         self,
         selected_indices: torch.Tensor,
@@ -513,12 +753,26 @@ class LMCBlender:
         rotary,
         layer_id: int,
         mode_label: str,
+        candidate_indices: Optional[torch.Tensor] = None,
     ):
         """Apply the first layer's token selection to one decoder layer."""
         num_tokens = q.shape[0]
 
         if self._active_metadata.imp_indices is None:
             self._active_metadata.imp_indices = selected_indices
+            if candidate_indices is None:
+                candidate_indices = torch.arange(
+                    effective_len,
+                    device=selected_indices.device,
+                    dtype=selected_indices.dtype,
+                )
+            self._record_selection_stats(
+                selected_indices=selected_indices,
+                candidate_indices=candidate_indices,
+                effective_len=effective_len,
+                layer_id=layer_id,
+                mode=mode_label,
+            )
             if self._active_metadata.positions.ndim == 2:
                 self._active_metadata.positions = self._active_metadata.positions[:, selected_indices]
             else:
@@ -571,8 +825,17 @@ class LMCBlender:
                 self._active_metadata.causal_blocks = self._causal_blocks(
                     layer_imp
                 )
+                if self._batched_partial_attention_label() is not None:
+                    self._active_metadata.scattered_cache_seqlens = (
+                        layer_imp.add(1).to(dtype=torch.int32)
+                    )
+                    self._active_metadata.scattered_cache_batch_idx = (
+                        torch.zeros_like(layer_imp, dtype=torch.int32)
+                    )
             else:
                 self._active_metadata.causal_blocks = None
+                self._active_metadata.scattered_cache_seqlens = None
+                self._active_metadata.scattered_cache_batch_idx = None
                 attn_metadata.update_from_top_indices(layer_imp)
             k = k.index_select(0, layer_imp)
             v = v.index_select(0, layer_imp)
@@ -611,6 +874,24 @@ class LMCBlender:
             run_start = cursor
         return blocks
 
+    def _batched_partial_attention_label(self) -> Optional[str]:
+        if (
+            self.blend_mode == "topk"
+            and getattr(self, "cacheblend_batched_partial_attention", False)
+        ):
+            return "cacheblend"
+        if (
+            self.blend_mode == "vlcache"
+            and getattr(self, "vlcache_batched_partial_attention", False)
+        ):
+            return "vlcache"
+        if (
+            self.blend_mode == "random"
+            and getattr(self, "random_batched_partial_attention", False)
+        ):
+            return "random"
+        return None
+
     def forward_attention(
         self,
         backend: Any,
@@ -623,6 +904,39 @@ class LMCBlender:
         blocks = self._active_metadata.causal_blocks
         if not blocks:
             return backend.forward_contiguous(q, k, v, output, attn_metadata)
+        batched_label = self._batched_partial_attention_label()
+        if batched_label is not None:
+            cache_seqlens = self._active_metadata.scattered_cache_seqlens
+            cache_batch_idx = self._active_metadata.scattered_cache_batch_idx
+            if cache_seqlens is None or cache_batch_idx is None:
+                raise RuntimeError(
+                    f"{batched_label} batched attention is missing query "
+                    "positions"
+                )
+            forward_scattered = getattr(
+                backend, "forward_scattered_shared_cache", None
+            )
+            if forward_scattered is None:
+                raise RuntimeError(
+                    f"{batched_label} batched attention requires FlashAttention "
+                    "shared-cache support"
+                )
+            result = forward_scattered(
+                q, k, v, output, cache_seqlens, cache_batch_idx
+            )
+            stats = self._active_metadata.selection_stats
+            path_key = f"{batched_label}_partial_attention_path"
+            calls_key = (
+                f"{batched_label}_partial_attention_calls_per_layer"
+            )
+            if stats is not None:
+                stats[path_key] = "shared_kv_batch"
+                stats[calls_key] = 1
+            self._last_selection_stats.update({
+                path_key: "shared_kv_batch",
+                calls_key: 1,
+            })
+            return result
         truncate_keys = getattr(attn_metadata, "truncate_keys", None)
         if truncate_keys is None:
             raise RuntimeError(
@@ -722,7 +1036,25 @@ class LMCBlender:
                     _hit = self._compute_hit_indices(total_len, k.device)
                     topk_num = int(
                         self._codecsight_select(_hit, total_len, k.device).numel())
+                    candidate_indices = torch.arange(
+                        total_len, device=diff_k.device, dtype=torch.long,
+                    )
+                elif self.topk_visual_only:
+                    hit_indices = self._compute_hit_indices(
+                        total_len, diff_k.device,
+                    )
+                    candidate_indices = self._visual_candidate_indices(
+                        hit_indices, self._active_metadata.mm_positions,
+                        total_len,
+                    )
+                    topk_num = max(1, int(
+                        candidate_indices.numel()
+                        * self.common_metadata.recomp_ratios[0]
+                    ))
                 else:
+                    candidate_indices = torch.arange(
+                        total_len, device=diff_k.device, dtype=torch.long,
+                    )
                     topk_num = int(
                         total_len * self.common_metadata.recomp_ratios[0]
                     )
@@ -737,8 +1069,24 @@ class LMCBlender:
                     k.norm().item(), old_k.norm().item(),
                     (diff_k > 1e-6).sum().item(), total_len,
                 )
-                top_indices = torch.topk(diff_k, k=topk_num).indices
+                local_top = torch.topk(
+                    diff_k[candidate_indices], k=topk_num,
+                ).indices
+                top_indices = candidate_indices[local_top]
                 top_indices, _ = torch.sort(top_indices)
+                if os.environ.get("COSTREAM_DIAGNOSTIC_REFRESH") == "1":
+                    top_indices = torch.cat((top_indices, self._diagnostic_text_indices(total_len, k.device))).unique(sorted=True)
+                    topk_num = int(top_indices.numel())
+                self._record_selection_stats(
+                    selected_indices=top_indices,
+                    candidate_indices=candidate_indices,
+                    effective_len=total_len,
+                    layer_id=layer_id,
+                    mode=(
+                        "topk_visual" if self.topk_visual_only
+                        else self.blend_mode
+                    ),
+                )
                 if self._time_sel:
                     torch.cuda.synchronize()
                     logger.info("SELECT_TIME mode=topk layer=%d ms=%.4f k=%d",
@@ -753,8 +1101,17 @@ class LMCBlender:
                     self._active_metadata.causal_blocks = self._causal_blocks(
                         top_indices
                     )
+                    if self._batched_partial_attention_label() is not None:
+                        self._active_metadata.scattered_cache_seqlens = (
+                            top_indices.add(1).to(dtype=torch.int32)
+                        )
+                        self._active_metadata.scattered_cache_batch_idx = (
+                            torch.zeros_like(top_indices, dtype=torch.int32)
+                        )
                 else:
                     self._active_metadata.causal_blocks = None
+                    self._active_metadata.scattered_cache_seqlens = None
+                    self._active_metadata.scattered_cache_batch_idx = None
                 if self._active_metadata.positions.ndim == 2:
                     self._active_metadata.positions = self._active_metadata.positions[:, top_indices]
                 else:
@@ -784,10 +1141,15 @@ class LMCBlender:
                     hit_indices, effective_len, q.device,
                 )
             elif self.blend_mode == "random":
+                candidate_indices = self._visual_candidate_indices(
+                    hit_indices, self._active_metadata.mm_positions,
+                    effective_len,
+                )
                 selected = self._random_select(
-                    hit_indices, effective_len, q.device,
+                    candidate_indices, effective_len, q.device,
                 )
             else:
+                candidate_indices = hit_indices
                 selected = self._vlcache_select(
                     hit_indices, effective_len, q.device,
                 )
@@ -800,6 +1162,7 @@ class LMCBlender:
                 selected, effective_len, q, k, v, old_k, old_v,
                 residual, attn_output, attn_metadata, rotary,
                 layer_id, self.blend_mode,
+                candidate_indices=candidate_indices,
             )
 
         # Subsequent layers: q/k/v/residual are already reduced to
@@ -951,6 +1314,16 @@ class LMCBlender:
         logger.info("enter blend")
         md = LMCBlendMetadata(imp_indices=None, attn_mask=None, positions=None)
         self._active_metadata = md
+        self._last_selection_stats = {}
+        cache_positions = kwargs.get("cache_positions")
+        if cache_positions is not None:
+            self._active_metadata.positions = self._validate_request_positions(
+                cache_positions, len(tokens), tokens.device,
+            )
+        elif self.is_mrope:
+            raise RuntimeError(
+                "mRoPE eager refresh requires supplied cache positions"
+            )
         tokens_per_frame = kwargs.get("tokens_per_frame")
         if tokens_per_frame is not None:
             self._active_metadata.tokens_per_frame = int(tokens_per_frame)
@@ -970,4 +1343,4 @@ class LMCBlender:
         # Two extra yields open and close the layerwise retrieval pipeline.
         for _ in range(self.num_layers + 2):
             next(layerwise_blender)
-        return None
+        return dict(self._last_selection_stats)

@@ -230,7 +230,8 @@ class StorageManager:
         if config.local_gpu:
             self.local_gpu_backend = self.storage_backends["LocalGPUBackend"]
 
-        self.manager_lock = threading.Lock()
+        self.manager_lock = threading.RLock()
+        self._layer_group_publication: dict[tuple, str] = {}
 
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
@@ -241,13 +242,11 @@ class StorageManager:
         self.async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None
         self.async_serializer: Optional[AsyncSerializer] = None
 
-        # The cuda stream for internal copies during put
         if is_cuda_worker(metadata):
             self.internal_copy_stream = torch.cuda.Stream()
         else:
             self.internal_copy_stream = None
 
-        # Proactive eviction thresholds (defaults can be overridden via extra_config)
         get_extra = config.get_extra_config_value
         self.enable_proactive_eviction = get_extra("enable_proactive_eviction", True)
         self.cpu_usage_high_watermark = (
@@ -264,6 +263,24 @@ class StorageManager:
         )
 
         self._setup_metrics()
+
+    def begin_layer_group_publication(self, keys: Sequence[CacheEngineKey]) -> None:
+        with self.manager_lock:
+            self._layer_group_publication[tuple(keys)] = "writing"
+
+    def commit_layer_group_publication(self, keys: Sequence[CacheEngineKey]) -> None:
+        with self.manager_lock:
+            self._layer_group_publication[tuple(keys)] = "committed"
+
+    def abort_layer_group_publication(self, keys: Sequence[CacheEngineKey]) -> None:
+        with self.manager_lock:
+            self._layer_group_publication[tuple(keys)] = "aborted"
+
+    def layer_group_publication_state(
+        self, keys: Sequence[CacheEngineKey]
+    ) -> Optional[str]:
+        with self.manager_lock:
+            return self._layer_group_publication.get(tuple(keys))
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -299,18 +316,43 @@ class StorageManager:
         if not self.enable_pd and (
             self.config.enable_async_loading or self.config.use_layerwise
         ):
-            assert self.allocator_backend is not None
-            self.async_serializer = AsyncSerializer(self.allocator_backend, self.loop)
+            if self.allocator_backend is None:
+                if self.storage_backends:
+                    raise RuntimeError(
+                        "Async LMCache retrieval requires an allocator backend"
+                    )
+                logger.info(
+                    "Skipping async serializer in no-storage mode"
+                )
+            else:
+                self.async_serializer = AsyncSerializer(
+                    self.allocator_backend, self.loop
+                )
 
     def _get_allocator_backend(
         self, config: LMCacheEngineConfig
-    ) -> AllocatorBackendInterface:
+    ) -> Optional[AllocatorBackendInterface]:
         if self.enable_pd:
             allocator_backend = self.storage_backends["PDBackend"]
         elif self.config.local_gpu:
             allocator_backend = self.storage_backends["LocalGPUBackend"]
-        else:
+        elif "LocalCPUBackend" in self.storage_backends:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
+        elif not self.storage_backends:
+            # A resident-only connector keeps K/V in vLLM's block pool and
+            # deliberately configures no LMCache persistence tier.  The
+            # engine is still needed for its GPU connector and request
+            # accounting, but no allocation is valid in this mode.
+            logger.info(
+                "No allocator backend configured; LMCache is running in "
+                "no-storage mode"
+            )
+            return None
+        else:
+            raise RuntimeError(
+                "LMCache storage backends were configured without an "
+                "allocator backend"
+            )
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 
@@ -447,7 +489,10 @@ class StorageManager:
         """
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
-        assert self.allocator_backend is not None
+        if self.allocator_backend is None:
+            raise RuntimeError(
+                "LMCache allocation is disabled in no-storage mode"
+            )
         return self.allocator_backend.allocate(
             shape, dtype, fmt, eviction=eviction, busy_loop=busy_loop
         )
@@ -469,7 +514,9 @@ class StorageManager:
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
         if self.allocator_backend is None:
-            raise RuntimeError("Allocator backend not available for scheduler role")
+            raise RuntimeError(
+                "LMCache allocation is disabled in no-storage mode"
+            )
         return self.allocator_backend.batched_allocate(
             shape, dtype, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
         )
