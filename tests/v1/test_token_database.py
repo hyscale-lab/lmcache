@@ -101,7 +101,7 @@ def test_segment_token_database(prefix_length, chunk_lengths):
     start = 0
     for chunk in chunks:
         end = start + len(chunk)
-        if start >= prefix_length:
+        if end > prefix_length:
             expected.append((
                 start,
                 end,
@@ -146,3 +146,26 @@ def test_segment_token_database_ranges_are_contiguous_without_tokenizer():
             results, results[1:], strict=False,
         )
     )
+
+
+def test_segment_mask_keeps_the_chunk_crossing_the_prefix_boundary():
+    db = SegmentTokenDatabase.__new__(SegmentTokenDatabase)
+    db.sep_tokens = torch.tensor([90, 91], dtype=torch.long)
+    db.sep_len = 2
+    db.hash_func = hash
+    db.metadata = None
+    tokens = torch.tensor([
+        1, 2, 90, 91,
+        10, 11, 90, 91,
+        20, 21, 90, 91,
+    ])
+    mask = torch.ones(len(tokens), dtype=torch.bool)
+    mask[:6] = False
+
+    results = list(db.process_tokens(
+        tokens=tokens, mask=mask, make_key=False,
+    ))
+
+    assert [(start, end) for start, end, _ in results] == [
+        (4, 8), (8, 12),
+    ]

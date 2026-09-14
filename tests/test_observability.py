@@ -48,6 +48,18 @@ def test_update_local_cache_usage(stats_monitor):
     assert stats.local_cache_usage_bytes == 1024
 
 
+def test_local_cache_usage_snapshot_preserves_high_watermark(stats_monitor):
+    stats_monitor.update_active_memory_objs_count(3)
+    stats_monitor.update_local_cache_usage(usage=1024)
+    stats_monitor.update_local_cache_usage(usage=256)
+
+    assert stats_monitor.get_local_cache_usage_snapshot() == (256, 1024, 3)
+    # Reading or clearing interval statistics must not destroy the lifetime
+    # resource high-watermark used by a fresh-server N=1 run.
+    stats_monitor.get_stats_and_clear()
+    assert stats_monitor.get_local_cache_usage_snapshot() == (256, 1024, 3)
+
+
 def test_update_remote_cache_usage(stats_monitor):
     stats_monitor.update_remote_cache_usage(usage=2048)
     stats = stats_monitor.get_stats_and_clear()
